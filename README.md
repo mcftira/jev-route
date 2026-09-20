@@ -7,7 +7,9 @@ published. Uncomment it (and delete this comment) once `jev-route` is on PyPI.
 
 **Run it. Log it. Distill it. Own it.**
 
+<!-- CI badge: re-enable when this account has GitHub Actions:
 [![CI](https://github.com/mcftira/jev-route/actions/workflows/ci.yml/badge.svg)](https://github.com/mcftira/jev-route/actions/workflows/ci.yml)
+-->
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
 <!-- [![PyPI](https://img.shields.io/pypi/v/jev-route.svg)](https://pypi.org/project/jev-route/) -->
