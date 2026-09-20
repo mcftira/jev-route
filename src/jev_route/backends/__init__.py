@@ -64,6 +64,32 @@ def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides:
             artifact=str(cfg.get("artifact", "./artifacts/jev-route-distilled")),
             feature_mode=bool(cfg.get("feature_mode", False)),
         )
+    if name == "laya":
+        # Imported lazily: the laya backend needs a local Laya checkpoint (and,
+        # for the real path, torch/transformers/laya). A deployment on Jev or
+        # the mock should not pay for any of it -- the same reason `distilled`
+        # above is lazy. The factory only resolves the calibration artifact and
+        # passes config through; loading the weights happens on first decide.
+        from .laya import LayaBackend
+        from .laya_calibration import load_artifact
+
+        calibration = cfg.get("calibration")
+        artifact = None
+        if isinstance(calibration, Mapping) and calibration.get("artifact"):
+            artifact = load_artifact(str(calibration["artifact"]))
+        elif isinstance(calibration, (str, bytes)):
+            artifact = load_artifact(calibration)
+        return LayaBackend(
+            model=str(cfg.get("model", "english")),
+            model_path=cfg.get("model_path"),
+            device=str(cfg.get("device", "auto")),
+            token_budget=int(cfg.get("token_budget", 448)),
+            max_len=int(cfg.get("max_len", 512)),
+            head_max_len=int(cfg.get("head_max_len", 192)),
+            role=str(cfg.get("role", "enforce")),
+            calibration=artifact,
+            include_domain=bool(cfg.get("include_domain", True)),
+        )
     if name == "shadow":
         from .shadow import ShadowBackend
 
@@ -82,7 +108,7 @@ def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides:
             log_disagreements=bool(cfg.get("log_disagreements", True)),
             shadow_timeout_seconds=float(cfg.get("shadow_timeout_seconds", 5.0)),
         )
-    raise BackendError(f"unknown backend {name!r}; expected one of: mock, jev, distilled, shadow")
+    raise BackendError(f"unknown backend {name!r}; expected one of: mock, jev, distilled, laya, shadow")
 
 
 __all__ = [

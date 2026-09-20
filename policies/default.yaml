@@ -14,6 +14,9 @@ version: 1
 #   mock      - deterministic, offline, no API key. Development and CI.
 #   jev       - TypeSafe cloud. Day one: calibrated, zero training data.
 #   distilled - a model trained from your own decision log. Air-gapped end state.
+#   laya      - the pretrained local edition: Laya System One on your hardware,
+#               no key, no egress. Requires a fitted calibration artifact in
+#               enforce mode (see the laya-route distribution).
 #   shadow    - run two backends, serve one, log disagreements. The cutover path.
 # ---------------------------------------------------------------------------
 backend:
@@ -26,6 +29,14 @@ backend:
   #   include_domain: true
   # distilled:
   #   artifact: ./artifacts/jev-route-distilled
+  # laya:
+  #   model: english            # english | multilingual | typed-decisions | auto
+  #   model_path: ./models/laya # local checkpoint dir; omit to resolve from the hub
+  #   device: auto              # auto | cpu | mps | cuda
+  #   token_budget: 448         # max tokens the excerpt may occupy (512 seq - head)
+  #   role: enforce             # enforce needs calibration.artifact; shadow is free
+  #   calibration:
+  #     artifact: ./artifacts/laya-calibration.json
   # shadow:
   #   primary: distilled
   #   shadow: jev

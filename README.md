@@ -34,7 +34,7 @@ plus a PII judgement and a task domain, and it does so with *calibrated confiden
                       │     local semantic model, shadow by           │
                       │     default                                   │
                       │ 3. redact    4. decide (jev | mock |          │
-                      │               distilled | shadow)             │
+                      │               distilled | laya | shadow)      │
                       │ 5. merge gate floors  6. escalate on          │
                       │               uncertainty                     │
                       │ 7. evaluate policy → tier + model             │
@@ -106,6 +106,13 @@ model to match the teacher's tiers on held-out data before `graduate --write` is
 allowed to touch your policy; the **gate track** needs the semantic layer to hit
 measured recall/precision numbers in shadow. Both gates print their numbers and
 refuse to write on failure. Deep dive: [docs/graduation.md](docs/graduation.md).
+
+There is a third, local-flavoured variant of the router track: instead of
+distilling a student from your own log, start from a pretrained open-source
+System-1 model and *calibrate* it on your traffic. That is what
+[laya-route](https://github.com/mcftira/laya-route) ships -- the same seam, a
+one-line `backend.name: laya` swap, fully air-gapped, $0 per decision, and a
+measured Jev-vs-Laya comparison table (the gap is a number, not a feeling).
 
 ### Shadow mode
 

@@ -11,7 +11,7 @@ as labeled decisions, you distill a local model from them, and then you swap one
 config value and the cloud dependency is gone. Nothing else in the system changes,
 because nothing else in the system ever knew.
 
-Three implementations ship with the package:
+Four implementations ship with the package:
 
 ``JevBackend``
     Cloud. The day-one path: needs an API key, no dataset, no training.
@@ -20,6 +20,10 @@ Three implementations ship with the package:
     demos, and CI never depend on a network or a paid account.
 ``DistilledBackend``
     Local. The end state: serves a model trained on your own decision log.
+``LayaBackend``
+    Local, pretrained. The air-gapped edition: serves the open-source Laya
+    System One model (arXiv:2503.23303) on local hardware, no key, no egress.
+    Its calibrated probabilities are a hard precondition of ``enforce`` mode.
 
 Implementations must obey two invariants:
 

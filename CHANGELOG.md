@@ -26,6 +26,17 @@ with the migration named.
 
 ### Added
 
+- `LayaBackend` (`jev_route.backends.laya`): the fully local, air-gapped decision
+  backend. Wraps the open-source Laya System-1 model (convaiinnovations/laya,
+  Apache-2.0, arXiv:2503.23303): all four questions in ONE `system_one` forward
+  pass with the native 1:1 question mapping, a deterministic head+tail excerpt
+  budget (448 tokens default) whose strategy and dropped-token count are written
+  onto every decision, and fail-closed `enforce` mode that refuses to construct
+  without a fitted calibration artifact. `laya_calibration` adds the temperature
+  (golden-section NLL) and isotonic (pure-Python PAV) fitters plus the versioned,
+  checksummed artifact format. The local-edition distribution (calibration CLI,
+  223-prompt eval, Jev-vs-Laya comparison, gate-head track) ships as laya-route.
+
 - Core routing chain in `jev_route.router.Router`: excerpt → local hard gate → redact → decide
   → merge gate floors → escalate on uncertainty → evaluate policy → log. Entry points
   `route_messages()`, `route_text()`, `route_text_sync()`, and `Router.from_policy_file()`.

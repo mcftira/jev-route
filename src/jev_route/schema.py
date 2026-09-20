@@ -55,8 +55,9 @@ TIERS: tuple[str, ...] = ("local", "cheap", "strong")
 DEFAULT_NOUL_THRESHOLD = 0.5
 
 #: Which decision backends exist. ``jev`` is the cloud bootstrap, ``mock`` runs
-#: with no key at all, ``distilled`` is the local end state.
-BackendName = Literal["jev", "mock", "distilled", "shadow"]
+#: with no key at all, ``distilled`` is a local model trained from your own log,
+#: and ``laya`` is the pretrained local edition (fully air-gapped).
+BackendName = Literal["jev", "mock", "distilled", "laya", "shadow"]
 
 
 # --------------------------------------------------------------------------- #
