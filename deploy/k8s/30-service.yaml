@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jev-route
+  namespace: jev-route
+  labels:
+    app.kubernetes.io/name: jev-route
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: jev-route
+    app.kubernetes.io/component: proxy
+  ports:
+    # 4100, not 4000: the cluster already has an unrelated LiteLLM on 4000.
+    - name: http
+      port: 4100
+      targetPort: http

@@ -1,0 +1,53 @@
+skinparam backgroundColor #FDFBF7
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #443F37
+skinparam sequence {
+  ParticipantBorderColor #1D5C58
+  ParticipantBackgroundColor #E2EEEC
+  LifeLineBorderColor #1D5C58
+  NoteBackgroundColor #FBF3EC
+  NoteBorderColor #A83A1C
+}
+skinparam rectangle {
+  BorderColor #443F37
+  BackgroundColor #FDFBF7
+}
+skinparam component {
+  BorderColor #1D5C58
+  BackgroundColor #E2EEEC
+  FontColor #1A1917
+}
+skinparam shadowing false
+@startuml
+title Shadow mode — earning the cutover
+
+actor "Client" as C
+participant "router" as R
+participant "ShadowBackend\n(backend.name: shadow)" as S
+participant "primary\ndistilled (serves)" as P
+participant "shadow\nJev teacher (telemetry)" as J
+participant "ring buffer\n+ on_disagreement" as B
+
+C -> R : request
+R -> S : decide()
+activate S
+S -> P : decide() — inline
+activate P
+P --> S : BackendResult (served unchanged)
+deactivate P
+S -> J : decide() — background task,\nbounded by shadow_timeout_seconds
+activate J
+note right of J : timeout / error / degraded\nrecords **agrees: None** —\nneither agreement nor disagreement
+J --> S : teacher result
+deactivate J
+S -> B : report (agrees? field-by-field)
+S --> R : primary's answer
+deactivate S
+R --> C : routed response
+
+note over B
+  The in-process buffer dies with the process;
+  durability comes from the on_disagreement callback
+  or the router-level side-run (record's `shadow` field).
+end note
+@enduml

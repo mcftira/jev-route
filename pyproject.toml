@@ -1,0 +1,148 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jev-route"
+version = "0.1.0"
+description = "Calibrated LLM routing you bootstrap in the cloud and end up owning. Run it. Log it. Distill it. Own it."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The jev-route Authors" }]
+keywords = [
+    "llm", "routing", "litellm", "calibration", "distillation",
+    "privacy", "pii", "data-residency", "typesafe", "jev",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# The core is deliberately thin: PyYAML for the policy file, httpx for the one
+# module that talks to a cloud API. Everything heavier is an extra, because a
+# router that runs inline on every request should not drag in a training stack.
+dependencies = [
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# LiteLLM proxy + SDK integrations.
+litellm = ["litellm>=1.101"]
+# Shared decision cache across proxy workers.
+redis = ["redis>=5.0"]
+# The graduation pipeline: export / train / evaluate / package.
+# numpy + scikit-learn only, so the default distillation path stays CPU-friendly.
+distill = ["numpy>=1.26", "scikit-learn>=1.4"]
+# Optional ModernBERT-class fine-tuning. Never required by the default path.
+distill-torch = ["jev-route[distill]", "torch>=2.3", "transformers>=4.44"]
+# The eval harness: labelled dataset, calibration curves, cost-simulation report.
+eval = ["jev-route[distill]", "pandas>=2.0", "matplotlib>=3.8"]
+dev = [
+    "jev-route[litellm,distill,eval]",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "python-dotenv>=1.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/mcftira/jev-route"
+Repository = "https://github.com/mcftira/jev-route"
+Issues = "https://github.com/mcftira/jev-route/issues"
+Documentation = "https://github.com/mcftira/jev-route/tree/main/docs"
+Changelog = "https://github.com/mcftira/jev-route/blob/main/CHANGELOG.md"
+
+[project.scripts]
+jev-route = "jev_route.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jev_route"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/jev_route",
+    "policies",
+    "evals",
+    "examples",
+    "deploy",
+    "docs",
+    "tests",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::FutureWarning", "error::DeprecationWarning"]
+markers = [
+    "network: tests that require real network access and credentials (skipped unless RUN_NETWORK_TESTS=1)",
+    "slow: long-running tests (skipped unless RUN_SLOW=1)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET", "ARG", "PLC", "PLE", "PLR", "RUF"]
+ignore = [
+    "PLR0913",  # the router and backend constructors take many keyword-only options by design
+    "PLR2004",  # magic numbers in threshold tests are the point of the test
+    "B008",     # function-call defaults are used for immutable module-level singletons
+    "SIM108",   # explicit if/else reads better than a nested ternary in policy code
+    # Lazy imports are a load-bearing design choice, not sloppiness: the core must
+    # not drag httpx/numpy/torch/redis into a process that only needs the gate.
+    # Each one sits inside a function with an actionable "pip install" error.
+    "PLC0415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG", "PLR2004", "B011"]
+"evals/**" = ["PLR0912", "PLR0915"]
+# An argparse subcommand table is long by nature; splitting it would make the CLI
+# harder to read, not easier.
+"src/jev_route/cli.py" = ["PLR0915", "C901"]
+# Backend and cache methods implement a Protocol: parameters are part of the
+# interface even where one implementation legitimately ignores them.
+"src/jev_route/backends/mock.py" = ["ARG002"]
+"src/jev_route/cache.py" = ["ARG002"]
+# NullSink exists to satisfy DecisionSink while doing nothing; the unused
+# parameter IS the implementation.
+"src/jev_route/logging_sink.py" = ["ARG002"]
+# Policy.from_dict validates ~15 config sections in one pass. Splitting it would
+# scatter one document's validation rules across a dozen functions.
+"src/jev_route/policy.py" = ["PLR0912"]
+# Router._route is the documented 8-step chain; reading it top to bottom is the
+# point. Extracting steps would hide the ordering, which is a security property.
+# PLR0912 for the same reason: the branch count IS the chain (gate, semantic
+# layer, cache, shadow, three escalations, failure path). Splitting it to satisfy
+# a counter would put the security-relevant ordering in two places.
+"src/jev_route/router.py" = ["PLR0912", "PLR0915"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+plugins = []
+mypy_path = "src"
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["litellm.*", "redis.*", "torch.*", "transformers.*", "sklearn.*", "matplotlib.*"]
+ignore_missing_imports = true

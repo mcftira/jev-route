@@ -1,0 +1,118 @@
+# The LiteLLM proxy with jev-route mounted.
+#
+# jev-route ships as source in a ConfigMap rather than as a custom image. That is
+# a deliberate trade: it needs no registry, no build step, and no arm64 image
+# bake on the cluster, and it makes the deployed code inspectable with
+# `kubectl get cm jev-route-code -o yaml`. The cost is a 1 MiB ConfigMap ceiling,
+# which the package is far under, and a rollout restart to pick up changes.
+# For production, build an image with `pip install jev-route[litellm]` instead --
+# deploy/k8s/README.md documents both paths.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jev-route-litellm
+  namespace: jev-route
+  labels:
+    app.kubernetes.io/name: jev-route
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jev-route
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jev-route
+        app.kubernetes.io/component: proxy
+    spec:
+      containers:
+        - name: litellm
+          # Pinned, not :main-latest. The ClassifierPlugin integration (mode 1)
+          # needs litellm >= 1.101; :main-latest on this cluster was serving
+          # 1.91.0, where that seam does not exist yet. Pinning also keeps the
+          # deployed proxy reproducible, which matters when the decision log is
+          # a dataset you intend to train on.
+          image: ghcr.io/berriai/litellm:v1.101.0
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            # /app is the image WORKDIR but is NOT automatically on sys.path when
+            # litellm starts via its console script. PYTHONPATH is what makes the
+            # mounted `jev_route` package importable by the dotted path in
+            # litellm_settings.callbacks.
+            - name: PYTHONPATH
+              value: /app
+            - name: JEV_ROUTE_POLICY
+              value: /app/policies/default.yaml
+            - name: JEV_ROUTE_DECISION_LOG
+              value: /var/log/jev-route/decisions.jsonl
+            - name: JEV_ROUTE_MANAGED_MODELS
+              value: "auto"
+            - name: ALIBABA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: jev-route-secrets
+                  key: ALIBABA_API_KEY
+            - name: TYPESAFE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: jev-route-secrets
+                  key: TYPESAFE_API_KEY
+            - name: JEV_ROUTE_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: jev-route-secrets
+                  key: JEV_ROUTE_MASTER_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            # Mounted as a package directory. ConfigMap `items[].path` supports
+            # subdirectories, which is what preserves backends/ and integrations/.
+            - name: code
+              mountPath: /app/jev_route
+              readOnly: true
+            - name: policy
+              mountPath: /app/policies
+              readOnly: true
+            - name: decision-log
+              mountPath: /var/log/jev-route
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            periodSeconds: 20
+            failureThreshold: 6
+      volumes:
+        - name: config
+          configMap:
+            name: jev-route-litellm-config
+        - name: code
+          configMap:
+            name: jev-route-code
+        - name: policy
+          configMap:
+            name: jev-route-policy
+        # The decision log is the training dataset. An emptyDir survives restarts
+        # but not reschedules; for anything real, point logging.path at a PVC or
+        # ship records to a sink. deploy/k8s/README.md covers both.
+        - name: decision-log
+          emptyDir: {}

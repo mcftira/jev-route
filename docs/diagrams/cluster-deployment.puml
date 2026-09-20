@@ -1,0 +1,47 @@
+skinparam backgroundColor #FDFBF7
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #443F37
+skinparam sequence {
+  ParticipantBorderColor #1D5C58
+  ParticipantBackgroundColor #E2EEEC
+  LifeLineBorderColor #1D5C58
+  NoteBackgroundColor #FBF3EC
+  NoteBorderColor #A83A1C
+}
+skinparam rectangle {
+  BorderColor #443F37
+  BackgroundColor #FDFBF7
+}
+skinparam component {
+  BorderColor #1D5C58
+  BackgroundColor #E2EEEC
+  FontColor #1A1917
+}
+skinparam shadowing false
+@startuml
+!pragma layout smetana
+title Deployment — DGX Spark cluster (namespace jev-route)
+
+rectangle "Kubernetes cluster · DGX Spark (arm64)" as K {
+  component "LiteLLM proxy v1.101\nmodel gateway · :4000" as LP
+  component "jev-route router\nOpenAI-compatible · :8000" as RT
+  component "decision log\n/var/log/jev-route (PVC)\ndecisions.jsonl + gate-blocks.jsonl" as DL
+  component "qwen38 — local tier\n:8010 · data never leaves" as Q
+}
+rectangle "outside the cluster · Alibaba MaaS" as O {
+  component "qwen3.8-max (strong tier)" as MAX
+  component "qwen3.8-flash (cheap tier)" as F
+}
+
+RT -down-> LP : all model calls through the gateway
+LP -down-> Q : local tier
+LP -down-> MAX : **egress**
+LP -down-> F : **egress**
+RT -right-> DL : every decision, soft distributions
+
+note right of DL
+  After graduation the two egress arrows
+  disappear: primary is local, shadow (if any)
+  is the only thing that crosses the boundary.
+end note
+@enduml

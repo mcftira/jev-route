@@ -1,0 +1,10 @@
+# jev-route runs in its own namespace, separate from the pre-existing `litellm`
+# namespace on this cluster, so the router can be installed, upgraded, and torn
+# down without touching anything else that is already using LiteLLM here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jev-route
+  labels:
+    app.kubernetes.io/name: jev-route
+    app.kubernetes.io/part-of: jev-route

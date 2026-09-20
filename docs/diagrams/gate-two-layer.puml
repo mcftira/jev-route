@@ -1,0 +1,45 @@
+skinparam backgroundColor #FDFBF7
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #443F37
+skinparam sequence {
+  ParticipantBorderColor #1D5C58
+  ParticipantBackgroundColor #E2EEEC
+  LifeLineBorderColor #1D5C58
+  NoteBackgroundColor #FBF3EC
+  NoteBorderColor #A83A1C
+}
+skinparam rectangle {
+  BorderColor #443F37
+  BackgroundColor #FDFBF7
+}
+skinparam component {
+  BorderColor #1D5C58
+  BackgroundColor #E2EEEC
+  FontColor #1A1917
+}
+skinparam shadowing false
+@startuml
+!pragma layout smetana
+title The two-layer local gate
+
+rectangle "raw excerpt" as R
+component "Layer 1 — deterministic\n22 detectors (15 hard + 7 advisory)\nchecksums: Luhn, IBAN mod-97, NHS mod-11, NINO\nalways runs · never bypassed" as L1
+component "Layer 2 — semantic\nsparse logistic regression, stdlib only\nshadow by default (scores, never blocks)\nenforce only on measured criteria" as L2
+component "resolve_floor()\nmaximum over the layers' floors\n— can only make routing stricter" as M
+component "final verdict\nsensitivity_floor · pii_floor\nforce_local · blocks_backend" as V
+component "gate-blocks.jsonl (separate stream)\ndetector ids + features + excerpt hash\nnever text — feeds rule improvement,\nnever model training" as BL
+component "semantic.json artifact\njson.load-able, provenance-checked\nrefuses to load if trained on\nblocked content" as A
+
+R -down-> L1 : every request
+R -down-> L2 : every request
+L1 -down-> M : layer-1 floors
+L2 -down-> M : layer-2 floors\n(only when enforced)
+M -down-> V
+L1 -right-> BL : on a blocking verdict
+A -up-> L2 : loaded + validated at start
+
+note bottom of L1
+  Advisory detectors never set a floor.
+  The detector list can be silenced; the scan cannot.
+end note
+@enduml

@@ -1,0 +1,97 @@
+# jev-route + LiteLLM proxy -- mode 3: the pre-call hook. Zero router coupling.
+#
+#   PYTHONPATH=src .venv/bin/litellm --config examples/litellm-proxy-hook/config.yaml --port 4000
+#   curl localhost:4000/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+#        -H 'content-type: application/json' \
+#        -d '{"model":"auto","messages":[{"role":"user","content":"Prove that this distributed lock is safe under partition"}]}'
+#
+# This is the least invasive way to run jev-route. There is no auto_router entry,
+# no complexity-router config, no tier machinery: a CustomLogger's
+# `async_pre_call_hook` sees the parsed request body before dispatch and rewrites
+# `data["model"]`. Clients keep calling one model name (`auto`); jev-route decides
+# which of the three deployments answers.
+#
+# It works on any litellm proxy version that has `async_pre_call_hook`, which is a
+# long-stable documented surface, rather than on the 1.101-era routing-plugin
+# pipeline. That is the trade: this mode cannot take part in litellm's own
+# load-balancing decisions inside a tier, because by the time the hook returns,
+# the model name is already fixed. If you want litellm to pick among several
+# deployments of the chosen tier, use mode 2 (the classifier) or mode 1 (the SDK
+# routing plugin).
+#
+# Two settings here matter more than they look:
+#
+#   1. JEV_ROUTE_MANAGED_MODELS=auto. A pre-call hook sees EVERY request the proxy
+#      receives. Without an opt-in list the default is "*", which would rewrite
+#      direct calls to `qwen3.8-max` too -- including the ones an operator pinned
+#      deliberately. Scope the hook to the alias you route through.
+#
+#   2. `auto` points at the LOCAL deployment. If the hook declines (timeout,
+#      internal error, nothing to judge) litellm routes the model the caller asked
+#      for, so the fallback destination should be the one where data cannot leak.
+#      Fail-closed is a property of this config, not of the hook.
+
+model_list:
+  # --- the entry clients call. Also the fail-closed destination. --------------
+  - model_name: auto
+    litellm_params:
+      model: openai/qwen3.8
+      api_base: http://192.168.1.124:8010/v1
+      api_key: "EMPTY"
+
+  # --- the three tiers. The policy file's `tiers:` values are these names. ----
+  - model_name: qwen38
+    litellm_params:
+      model: openai/qwen3.8
+      api_base: http://192.168.1.124:8010/v1
+      api_key: "EMPTY"
+
+  - model_name: qwen3.8-flash
+    litellm_params:
+      model: openai/qwen3.8-flash
+      api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/ALIBABA_API_KEY
+
+  - model_name: qwen3.8-max
+    litellm_params:
+      model: openai/qwen3.8-max
+      api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/ALIBABA_API_KEY
+
+litellm_settings:
+  # litellm resolves each entry with get_instance_fn: the last dotted segment is
+  # a module attribute holding an INSTANCE. `proxy_handler_instance` is that
+  # instance, built at import time from the environment, and it never raises --
+  # a missing policy file or a missing TYPESAFE_API_KEY degrades to the built-in
+  # policy on the offline MockBackend so the proxy still boots.
+  callbacks: jev_route.integrations.litellm_hook.proxy_handler_instance
+  drop_params: true
+
+# Note on auth, learned the hard way while verifying this file: with
+# `general_settings.master_key` set, a caller must send that exact key. Any other
+# key makes LiteLLM look it up in its virtual-key store, and with no
+# `DATABASE_URL` the request fails with `{"error":{"message":"No connected db."}}`
+# -- a 400 that has nothing to do with jev-route. Set DATABASE_URL if you want
+# virtual keys; otherwise send the master key.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# Environment for this example:
+#   export PYTHONPATH=/path/to/jev-route/src      # or: pip install -e .
+#   export JEV_ROUTE_POLICY=/path/to/jev-route/policies/default.yaml
+#   export JEV_ROUTE_MANAGED_MODELS=auto          # see note 1 above
+#   export ALIBABA_API_KEY=...                    # for the cheap/strong tiers
+#   export TYPESAFE_API_KEY=...                   # only if the policy says backend.name: jev
+#   export JEV_ROUTE_DECISION_LOG=/var/log/jev-route/decisions.jsonl   # optional
+#   export JEV_ROUTE_TIMEOUT_MS=3000              # optional per-request budget
+#
+# Where the decision went:
+#   * the full record -- soft probability distributions included -- is appended
+#     to the policy's `logging.path` (or JEV_ROUTE_DECISION_LOG). That file is
+#     the training set.
+#   * a compact summary is stamped into the request's `metadata.jev_route`, so it
+#     shows up in litellm's spend logs next to the cost of the request it caused.
+#     `metadata.jev_route.request_id` is the join key between the two files.
+#   * nothing is written a second time when the response arrives. Observing the
+#     outcome is a distillation-time join, not a second row in a versioned
+#     dataset; see JevRoutePreCallHook.async_log_success_event for the argument.

@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jev-route — system design</title>
+<style>
+/* Palette is semantic, not decorative: oxide red marks anything that leaves the
+   building, deep teal marks anything that stays inside it. A reader can scan the
+   page for red and know where the egress risks are without reading a word. */
+:root{
+  --paper:#f7f5f0; --paper-2:#efECE4; --paper-3:#e6e2d8;
+  --ink:#1a1917; --ink-2:#443f37; --muted:#736d61;
+  --rule:#cdc7b8;
+  --egress:#a83a1c; --egress-bg:#f6e7e1;
+  --local:#1d5c58; --local-bg:#e2eeec;
+  --cloud:#2f4a7a; --cloud-bg:#e5eaf3;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:var(--serif); font-size:17px; line-height:1.62;
+  font-variant-numeric:oldstyle-nums;
+}
+.wrap{max-width:1120px; margin:0 auto; padding:0 28px 96px}
+h1,h2,h3,h4,.kicker,.num,table,.box-t{font-family:var(--mono)}
+h1{font-size:30px; letter-spacing:-.02em; margin:0; font-weight:600}
+h2{font-size:13px; letter-spacing:.16em; text-transform:uppercase; font-weight:600;
+   margin:0 0 6px; color:var(--ink)}
+h3{font-size:15px; margin:0 0 4px; font-weight:600; letter-spacing:-.01em}
+p{margin:0 0 14px}
+a{color:var(--egress)}
+code,.mono{font-family:var(--mono); font-size:.855em}
+.lede{font-size:19.5px; line-height:1.55; color:var(--ink-2); max-width:64ch}
+.kicker{font-size:11px; letter-spacing:.19em; text-transform:uppercase; color:var(--muted); margin:0 0 10px}
+section{padding:52px 0 0; border-top:1px solid var(--rule); margin-top:52px}
+section:first-of-type{border-top:0; margin-top:0}
+.secnum{font-family:var(--mono); font-size:11px; color:var(--muted); letter-spacing:.14em}
+.hdr{display:flex; align-items:baseline; gap:14px; margin-bottom:18px}
+.hdr h2{margin:0}
+.masthead{padding:54px 0 0}
+.masthead .top{display:flex; justify-content:space-between; align-items:flex-end; gap:32px; flex-wrap:wrap}
+.tag{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+     border:1px solid var(--rule); padding:4px 9px; color:var(--muted); background:var(--paper-2)}
+/* --- measured-numbers strip: these are results, not marketing stats --- */
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr));
+       border:1px solid var(--rule); border-bottom:0; margin-top:34px; background:var(--paper-2)}
+.stat{border-bottom:1px solid var(--rule); border-right:1px solid var(--rule); padding:15px 16px 13px}
+.stat:last-child{border-right:0}
+.stat .v{font-family:var(--mono); font-size:25px; font-weight:600; letter-spacing:-.02em; line-height:1.1}
+.stat .l{font-family:var(--mono); font-size:10.5px; letter-spacing:.09em; text-transform:uppercase;
+         color:var(--muted); margin-top:7px; line-height:1.45}
+.prov{font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:9px; line-height:1.6}
+
+/* --- pipeline diagram --- */
+.flow{border:1px solid var(--rule); background:#fff; margin-top:8px}
+.stage{display:grid; grid-template-columns:44px 1fr; border-bottom:1px solid var(--rule)}
+.stage:last-child{border-bottom:0}
+.stage .num{font-family:var(--mono); font-size:12px; color:var(--muted); padding:15px 0 0 15px;
+            border-right:1px solid var(--rule); text-align:left}
+.stage .body{padding:14px 18px 15px}
+.stage h3{margin-bottom:5px}
+.stage p{margin:0; font-size:15.5px; color:var(--ink-2); max-width:78ch}
+.stage .mod{font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:7px; letter-spacing:.01em}
+.stage.hard{background:var(--local-bg)}
+.stage.hard .num{color:var(--local); font-weight:600}
+.stage.egress{background:var(--egress-bg)}
+.stage.egress .num{color:var(--egress); font-weight:600}
+.stage.cloud{background:var(--cloud-bg)}
+.stage.cloud .num{color:var(--cloud); font-weight:600}
+/* the trust boundary, drawn across the pipeline */
+.boundary{display:grid; grid-template-columns:44px 1fr; background:var(--ink); color:var(--paper)}
+.boundary .num{border-right:1px solid #4a463d}
+.boundary .body{padding:11px 18px; font-family:var(--mono); font-size:11.5px; letter-spacing:.05em}
+.boundary b{color:#f0b49c; font-weight:600}
+.boundary .yes{color:#9fd6cf}
+/* --- generic boxes --- */
+.grid{display:grid; gap:14px; margin-top:8px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(310px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+.box{border:1px solid var(--rule); background:#fff; padding:15px 17px 14px}
+.box-t{font-size:12px; letter-spacing:.05em; text-transform:uppercase; font-weight:600; margin-bottom:8px}
+.box p{font-size:15px; margin:0; color:var(--ink-2)}
+.box.egress{border-left:3px solid var(--egress)}
+.box.local{border-left:3px solid var(--local)}
+.box.cloud{border-left:3px solid var(--cloud)}
+.box .mod{font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:9px; display:block}
+.pill{display:inline-block; font-family:var(--mono); font-size:10px; letter-spacing:.08em;
+      text-transform:uppercase; padding:2px 7px; border:1px solid currentColor; margin-left:6px;
+      vertical-align:1px}
+.pill.e{color:var(--egress)} .pill.l{color:var(--local)} .pill.c{color:var(--cloud)}
+/* --- tables --- */
+table{width:100%; border-collapse:collapse; font-size:13.5px; margin-top:8px; background:#fff}
+th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--rule); vertical-align:top}
+th{font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+   border-bottom:1px solid var(--ink); font-weight:600}
+td.k{font-family:var(--mono); font-size:12.5px}
+tr:last-child td{border-bottom:0}
+.tbl{border:1px solid var(--rule)}
+/* --- callout --- */
+.callout{border-left:3px solid var(--ink); background:var(--paper-2); padding:16px 20px; margin-top:10px}
+.callout .box-t{margin-bottom:6px}
+.callout p{font-size:16px; margin:0 0 9px; max-width:80ch}
+.callout p:last-child{margin:0}
+blockquote{margin:0; padding:0; font-size:19px; line-height:1.5; font-style:italic; color:var(--ink)}
+/* --- graduation cycle --- */
+.cycle{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:0;
+       border:1px solid var(--rule); background:#fff; margin-top:8px}
+.cyc{padding:16px 18px 15px; border-right:1px solid var(--rule); position:relative}
+.cyc:last-child{border-right:0}
+.cyc .n{font-family:var(--mono); font-size:11px; color:var(--muted); letter-spacing:.12em}
+.cyc h3{margin:6px 0 6px; font-size:16px}
+.cyc p{font-size:14.5px; margin:0; color:var(--ink-2)}
+.cyc .mod{font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:9px; display:block}
+.legend{display:flex; gap:20px; flex-wrap:wrap; font-family:var(--mono); font-size:11px;
+        color:var(--muted); margin-top:12px; letter-spacing:.04em}
+.legend span{display:inline-flex; align-items:center; gap:7px}
+.sw{width:11px; height:11px; border:1px solid var(--rule); display:inline-block}
+.note{font-family:var(--mono); font-size:11.5px; color:var(--muted); line-height:1.65; margin-top:14px}
+.warn{border:1px solid var(--egress); background:var(--egress-bg); padding:14px 17px; margin-top:10px}
+.warn .box-t{color:var(--egress)}
+.warn p{font-size:15px; margin:0; color:var(--ink-2)}
+@media(max-width:640px){ body{font-size:16px} .wrap{padding:0 18px 72px} h1{font-size:24px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <div class="top">
+    <div>
+      <p class="kicker">system design &nbsp;·&nbsp; v1 &nbsp;·&nbsp; apache-2.0</p>
+      <h1>jev-route</h1>
+      <p class="lede" style="margin-top:14px">
+        A calibrated router that sends each LLM request to the cheapest model that can
+        <em>safely</em> answer it. It decides with probability distributions rather than
+        a single label, keeps sensitive data inside your own infrastructure, and logs
+        every decision so you can eventually replace the thing it depends on.
+      </p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:7px;align-items:flex-end">
+      <span class="tag">223-prompt labelled eval</span>
+      <span class="tag">1,798 tests passing</span>
+      <span class="tag">runs offline, no api key</span>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="v">72.2<span style="font-size:15px">%</span></div><div class="l">tier accuracy</div></div>
+    <div class="stat"><div class="v">0.129</div><div class="l">sensitivity ECE<br>(calibration error)</div></div>
+    <div class="stat"><div class="v" style="color:var(--local)">&minus;64.3<span style="font-size:15px">%</span></div><div class="l">cost vs always<br>using the strongest</div></div>
+    <div class="stat"><div class="v">318<span style="font-size:15px">ms</span></div><div class="l">decision latency p50<br>(725 / 791 p95 / p99)</div></div>
+    <div class="stat"><div class="v" style="color:var(--egress)">11</div><div class="l">privacy violations<br>on 223 prompts</div></div>
+  </div>
+  <p class="prov">
+    Measured against the real TypeSafe Jev backend on <code>evals/data/labeled_prompts.jsonl</code>
+    (223 prompts), policy <code>policies/default.yaml</code>. Reproduce with
+    <code>python evals/run_eval.py --backend both</code>. A &ldquo;privacy violation&rdquo; is a prompt
+    whose label requires the air-gapped tier that the router sent to a cloud tier &mdash; it is not
+    an accuracy error, and it is the number that matters most in this file.
+  </p>
+</header>
+
+<section>
+  <div class="hdr"><span class="secnum">01</span><h2>The request path</h2></div>
+  <p style="max-width:80ch">
+    One request, eight stages, in a fixed order. The order <em>is</em> the design: the gate runs
+    before any model is consulted, because a model cannot be asked whether something is safe to
+    send to a model. The gate itself is two local layers &mdash; deterministic, then semantic &mdash;
+    and both stay inside the process. Colour marks where data is allowed to go &mdash; read the red
+    rows as the only places anything leaves the building.
+  </p>
+
+  <div class="flow">
+    <div class="stage"><div class="num">1</div><div class="body">
+      <h3>Normalise &amp; excerpt</h3>
+      <p>Messages or a raw string become one bounded excerpt. Nothing is sent anywhere yet.</p>
+      <span class="mod">router.py · prompts.excerpt_messages / excerpt_from_text</span>
+    </div></div>
+
+    <div class="stage hard"><div class="num">2</div><div class="body">
+      <h3>Local gate, two layers <span class="pill l">never bypassed</span></h3>
+      <p>
+        <strong>Layer ①</strong> is deterministic: regex and checksum detectors run on the
+        <strong>raw</strong> excerpt &mdash; before redaction, so redaction cannot hide a match from
+        it. Findings set sensitivity floors and can force the local tier and block the cloud backend
+        outright. No model is consulted, no network call is made, and the same input always produces
+        the same verdict. <strong>Layer ②</strong> is a distilled semantic model, local as well: it
+        catches the contextual sensitivity layer ① cannot see. Shadow by default &mdash; it scores,
+        records, never blocks; enforce mode can raise the floor and force local, and only after
+        measured criteria passed at construction. Layer ① remains the floor whatever layer ② says.
+      </p>
+      <span class="mod">gate.py · HardGate.scan → GateVerdict · gate_semantic.py · SemanticLayer</span>
+    </div></div>
+
+    <div class="stage"><div class="num">3</div><div class="body">
+      <h3>Redact &amp; fingerprint</h3>
+      <p>
+        Anything that may leave the process is redacted; the raw excerpt is reduced to a salted
+        16-hex digest. Caller metadata is filtered by an unsafe-<em>key</em> list as well as by type,
+        because <code>{"prompt": "…"}</code> is a scalar and would otherwise ride along into the log.
+      </p>
+      <span class="mod">prompts.py · redact / hash_text / compute_features / safe_caller_metadata</span>
+    </div></div>
+
+    <div class="boundary"><div class="num"></div><div class="body">
+      TRUST BOUNDARY &nbsp;—&nbsp; only the <span class="yes">redacted excerpt + features + allowlisted metadata</span>
+      may cross, and only if the gate did not block. <b>If the gate fired, nothing crosses at all.</b>
+    </div></div>
+
+    <div class="stage"><div class="num">4</div><div class="body">
+      <h3>Cache, then ask the decision backend</h3>
+      <p>
+        The cache stores the backend&rsquo;s <em>judgement</em>, not the final decision &mdash; so a policy
+        change applies immediately to cached traffic instead of being frozen behind it. On a miss the
+        backend answers with full soft distributions. A backend outage degrades to maximum
+        uncertainty; it never raises into the request path.
+      </p>
+      <span class="mod">cache.py · backends/* → BackendResult(answers, degraded, latency_ms)</span>
+    </div></div>
+
+    <div class="stage hard"><div class="num">5</div><div class="body">
+      <h3>Merge the gate floor over the answer</h3>
+      <p>
+        Maximum, never minimum. A model saying &ldquo;public&rdquo; cannot outvote a deterministic
+        finding of &ldquo;regulated&rdquo;, and a layer&nbsp;② that answers &ldquo;public&rdquo;
+        contributes nothing &mdash; <code>resolve_floor</code> is a maximum over the layers, so both
+        gate layers can only ever make routing stricter.
+      </p>
+      <span class="mod">router.py · schema.bump_within over SENSITIVITY_LEVELS</span>
+    </div></div>
+
+    <div class="stage"><div class="num">6</div><div class="body">
+      <h3>Escalate on low confidence</h3>
+      <p>
+        Uncertainty is only ever resolved <em>upward</em>. Below a confidence threshold the answer is
+        bumped one level; below a much lower &ldquo;too uncertain to egress&rdquo; floor it goes straight
+        to the safest tier. Both thresholds are calibrated against measurement, not taste.
+      </p>
+      <span class="mod">policy.UncertaintyPolicy · router.py stage 6</span>
+    </div></div>
+
+    <div class="stage"><div class="num">7</div><div class="body">
+      <h3>Resolve tier &amp; model</h3>
+      <p>
+        A safe-AST rule engine &mdash; no <code>eval</code>, no calls, no attribute access &mdash; picks
+        the first matching rule. Data protection rules precede capability rules, so a hard task on
+        regulated data is still regulated.
+      </p>
+      <span class="mod">policy.py · Policy.evaluate → (rule, tier, model)</span>
+    </div></div>
+
+    <div class="stage hard"><div class="num">8</div><div class="body">
+      <h3>Log the decision <span class="pill l">this is the dataset</span></h3>
+      <p>
+        Every decision is appended with its <strong>full soft distributions</strong>, not just the
+        argmax. That single choice is what turns an audit log into training data &mdash; a label tells
+        you what the teacher picked, a distribution tells you how sure it was.
+      </p>
+      <span class="mod">logging_sink.py · schema.DecisionRecord (schema-versioned JSONL)</span>
+    </div></div>
+  </div>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--local-bg);border-color:var(--local)"></i> stays local / deterministic</span>
+    <span><i class="sw" style="background:var(--cloud-bg);border-color:var(--cloud)"></i> may cross the boundary</span>
+    <span><i class="sw" style="background:var(--egress-bg);border-color:var(--egress)"></i> egress risk</span>
+    <span><i class="sw" style="background:var(--ink)"></i> trust boundary</span>
+  </div>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">02</span><h2>The decision backend</h2></div>
+  <p style="max-width:80ch">
+    One protocol sits at the centre of the system, and swapping its implementation is the entire
+    graduation story. Nothing else in the router knows or cares whether the judgement came from a
+    cloud model, a heuristic, or a file on disk.
+  </p>
+  <div class="callout" style="margin-bottom:16px">
+    <div class="box-t">The protocol</div>
+    <p style="font-family:var(--mono);font-size:13.5px;margin:0">
+      class DecisionBackend:<br>
+      &nbsp;&nbsp;async def decide(self, req: DecisionRequest) -&gt; BackendResult<br>
+      <span style="color:var(--muted)"># must not raise on outage — degrade to maximum uncertainty instead</span>
+    </p>
+  </div>
+  <div class="grid g4">
+    <div class="box cloud">
+      <div class="box-t">Jev <span class="pill c">bootstrap</span></div>
+      <p>Calls TypeSafe System One for calibrated judgements. Needs no training data of your own, which is what makes the zero-training claim literally true.</p>
+      <span class="mod">backends/jev.py — the ONLY module permitted to name the cloud endpoint</span>
+    </div>
+    <div class="box local">
+      <div class="box-t">Mock <span class="pill l">offline</span></div>
+      <p>Deliberately underconfident keyword heuristics. Lets the whole repo run end to end with no API key and no network, which is how every test and CI job works.</p>
+      <span class="mod">backends/mock.py</span>
+    </div>
+    <div class="box local">
+      <div class="box-t">Distilled <span class="pill l">end state</span></div>
+      <p>Your own trained student, loaded from a packaged artifact. Local, fast, and yours. This is what the system is trying to become.</p>
+      <span class="mod">backends/distilled.py · distill/artifact.py</span>
+    </div>
+    <div class="box">
+      <div class="box-t">Shadow <span class="pill e">cutover</span></div>
+      <p>Runs two backends, serves one, logs the disagreement. How you cut over without finding out in production that the student is worse.</p>
+      <span class="mod">backends/shadow.py</span>
+    </div>
+  </div>
+  <p class="note">
+    The egress boundary is enforced by a test, not a convention: <code>grep -r api.typesafe.ai src/</code>
+    must return exactly one file. Delete <code>backends/jev.py</code> and the cloud dependency is gone —
+    which is the property that makes &ldquo;own it&rdquo; a real promise rather than a slogan.
+  </p>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">03</span><h2>The two-layer gate</h2></div>
+  <div class="callout">
+    <div class="box-t">The bootstrap paradox</div>
+    <blockquote>
+      The gate cannot ask the cloud whether something is safe to send to the cloud.
+    </blockquote>
+    <p style="margin-top:14px">
+      Everything about this layer follows from that sentence. The deterministic floor never asks a
+      model, because the model call <em>is</em> the thing being guarded. And the semantic model is
+      trained only on synthetic and public positives plus real production <strong>negatives</strong> —
+      never on real blocked content. <strong>The gate never trains on your secrets.</strong>
+    </p>
+  </div>
+
+  <div class="flow" style="margin-top:18px">
+    <div class="stage hard"><div class="num">①</div><div class="body">
+      <h3>Deterministic floor <span class="pill l">permanent</span></h3>
+      <p>
+        Regex and checksums: Luhn-validated card numbers, IBAN mod-97, SSN, MRN, credentials, basic-auth
+        URLs. Auditable, reproducible, and it never asks a model. <strong>It is never removed</strong> —
+        a semantic layer is a statistical model and the floor is a checksum, and where a false negative
+        means data left the building you do not retire the checksum because the model got good.
+      </p>
+    </div></div>
+    <div class="stage cloud"><div class="num">②</div><div class="body">
+      <h3>Distilled semantic layer <span class="pill c">shadow by default</span></h3>
+      <p>
+        A local model that catches contextual sensitivity regex cannot see — an HR disciplinary narrative,
+        a legal privilege discussion, a clinical note in prose. None of those contains a single detectable
+        identifier. It runs, scores, and logs disagreements with layer ①, and <strong>it never blocks</strong>
+        until it has earned promotion.
+      </p>
+    </div></div>
+    <div class="stage"><div class="num">③</div><div class="body">
+      <h3>Router</h3>
+      <p>JevBackend now; DistilledBackend after graduation. Stage 5 above merges the floor over whatever this returns, by maximum.</p>
+    </div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="box">
+      <div class="box-t">Hard findings vs advisory topics</div>
+      <p>
+        Structured identifiers and credentials set floors. Topic keywords (HIPAA, PCI, GDPR) are
+        <em>advisory hints only</em> and never move a floor. Collapsing the two is exactly how regex
+        guardrails end up air-gapping every compliance question — so &ldquo;explain how HIPAA works&rdquo;
+        routes to the cheap cloud tier while a chart containing an SSN never leaves the building.
+        Both behaviours are verified against the live cluster.
+      </p>
+    </div>
+    <div class="box egress">
+      <div class="box-t">Promotion to enforce is earned, not configured</div>
+      <p>
+        A config flag alone must not be sufficient. Promotion requires measured recall on a held-out
+        positive set, a bounded false-positive rate on real negatives, and a bounded disagreement rate
+        against layer ①. If the criteria are not met the router refuses <em>loudly, with the numbers</em>
+        rather than silently degrading to shadow — a silent downgrade is how a gate that looks enforced
+        stops being enforced.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">04</span><h2>Graduation — two separate tracks</h2></div>
+  <p style="max-width:80ch">
+    The router and the gate learn from different data and have different failure modes, so they
+    graduate separately with separate readiness criteria. Conflating them is how a project ends up
+    claiming the gate is &ldquo;trained on your traffic&rdquo; when it cannot be.
+  </p>
+
+  <p class="kicker" style="margin-top:22px">Track A — the router</p>
+  <div class="cycle">
+    <div class="cyc"><div class="n">01</div><h3>Run it</h3>
+      <p>Bootstrap on Jev cloud judgements. No training data of your own required.</p>
+      <span class="mod">backend: jev</span></div>
+    <div class="cyc"><div class="n">02</div><h3>Log it</h3>
+      <p>Every decision is appended with full soft distributions. The log <em>is</em> the dataset.</p>
+      <span class="mod">logging_sink.py → decisions.jsonl</span></div>
+    <div class="cyc"><div class="n">03</div><h3>Distill it</h3>
+      <p>Export, train a student on soft targets with KL, evaluate teacher agreement and calibration.</p>
+      <span class="mod">distill/export · train · evaluate</span></div>
+    <div class="cyc"><div class="n">04</div><h3>Own it</h3>
+      <p>Shadow the student against the teacher, then cut over and delete the cloud dependency.</p>
+      <span class="mod">backend: shadow → distilled</span></div>
+  </div>
+
+  <p class="kicker" style="margin-top:26px">Track B — the gate</p>
+  <div class="cycle">
+    <div class="cyc"><div class="n">01</div><h3>Generate</h3>
+      <p>Synthetic PII that is provably fake <em>by reservation</em>, plus contextual positives that fire no detector at all.</p>
+      <span class="mod">distill/sensitivity_data.py</span></div>
+    <div class="cyc"><div class="n">02</div><h3>Label</h3>
+      <p>Only the allowed sources go to Jev, storing soft distributions as teacher labels with the source category logged for audit.</p>
+      <span class="mod">jev-route distill label-sensitivity</span></div>
+    <div class="cyc"><div class="n">03</div><h3>Shadow</h3>
+      <p>Layer ② scores live traffic and logs disagreements with layer ①. It never blocks.</p>
+      <span class="mod">gate.semantic.mode: shadow</span></div>
+    <div class="cyc"><div class="n">04</div><h3>Enforce</h3>
+      <p>Promote only when the measured criteria pass. Layer ① remains the floor regardless.</p>
+      <span class="mod">gate.semantic.mode: enforce</span></div>
+  </div>
+
+  <div class="callout" style="margin-top:20px">
+    <div class="box-t">Why the synthetic data has to be provably fake, not just randomised</div>
+    <p>
+      A randomised 3-digit SSN area collides with real issued ranges — so &ldquo;synthetic&rdquo; would
+      silently mean &ldquo;possibly somebody&rsquo;s actual data&rdquo;, and the entire argument collapses.
+      The generator therefore uses values reserved by the issuing authority: SSN areas <code>000</code>,
+      <code>666</code> and <code>900&ndash;999</code> (the SSA will never issue them), RFC&nbsp;2606
+      reserved email domains, and the reserved fictional telephone block.
+    </p>
+    <p>
+      Payment cards carry a real tension worth knowing about. A Luhn-<em>invalid</em> number is provably
+      not a real card — but layer ① validates cards with Luhn, so Luhn-invalid synthetic cards never fire
+      it, and layer-① recall becomes untestable. Published provider <em>test ranges</em> resolve this:
+      Luhn-valid, publicly reserved, provably not a cardholder&rsquo;s data, and still caught by the floor.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">05</span><h2>Deployment topology</h2></div>
+  <p style="max-width:80ch">
+    Verified live on a k3s cluster. The router ships as a ConfigMap-mounted source tree with
+    <code>PYTHONPATH=/app</code> — no custom image, no registry. LiteLLM loads it as a pre-call hook,
+    so clients just call the model alias <code>auto</code> and never learn routing exists.
+  </p>
+
+  <svg viewBox="0 0 1040 400" style="width:100%;height:auto;margin-top:14px;border:1px solid var(--rule);background:#fff" role="img" aria-label="Cluster deployment topology">
+    <style>
+      .lbl{font-family:var(--mono);font-size:11px;fill:#443f37}
+      .ttl{font-family:var(--mono);font-size:11px;font-weight:600;fill:#1a1917;letter-spacing:.06em}
+      .sm{font-family:var(--mono);font-size:9.5px;fill:#736d61}
+      .bx{fill:#f7f5f0;stroke:#cdc7b8}
+      .ar{stroke:#736d61;stroke-width:1.4;fill:none;marker-end:url(#ah)}
+      .are{stroke:#a83a1c;stroke-width:1.6;fill:none;marker-end:url(#ahr)}
+      .arl{stroke:#1d5c58;stroke-width:1.6;fill:none;marker-end:url(#ahl)}
+    </style>
+    <defs>
+      <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#736d61"/></marker>
+      <marker id="ahr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#a83a1c"/></marker>
+      <marker id="ahl" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1d5c58"/></marker>
+    </defs>
+
+    <rect x="18" y="80" width="130" height="72" class="bx"/>
+    <text x="83" y="106" text-anchor="middle" class="ttl">CLIENT</text>
+    <text x="83" y="124" text-anchor="middle" class="sm">model: "auto"</text>
+    <text x="83" y="138" text-anchor="middle" class="sm">OpenAI-compatible</text>
+
+    <rect x="190" y="26" width="500" height="348" fill="none" stroke="#1d5c58" stroke-dasharray="5 4"/>
+    <text x="202" y="46" class="ttl" fill="#1d5c58">KUBERNETES CLUSTER · namespace jev-route</text>
+
+    <rect x="212" y="64" width="190" height="106" class="bx"/>
+    <text x="307" y="88" text-anchor="middle" class="ttl">LiteLLM proxy v1.101</text>
+    <text x="307" y="106" text-anchor="middle" class="sm">service :4100</text>
+    <text x="307" y="124" text-anchor="middle" class="lbl">callbacks:</text>
+    <text x="307" y="142" text-anchor="middle" class="sm">jev_route.integrations</text>
+    <text x="307" y="156" text-anchor="middle" class="sm">.litellm_hook</text>
+
+    <rect x="212" y="214" width="190" height="136" class="bx" fill="#e2eeec" stroke="#1d5c58"/>
+    <text x="307" y="238" text-anchor="middle" class="ttl" fill="#1d5c58">jev-route Router</text>
+    <text x="307" y="258" text-anchor="middle" class="sm">① hard gate (local)</text>
+    <text x="307" y="274" text-anchor="middle" class="sm">② semantic gate (shadow)</text>
+    <text x="307" y="290" text-anchor="middle" class="sm">redact · features · cache</text>
+    <text x="307" y="306" text-anchor="middle" class="sm">backend → escalate</text>
+    <text x="307" y="322" text-anchor="middle" class="sm">policy rules → tier</text>
+    <text x="307" y="340" text-anchor="middle" class="sm" fill="#1d5c58">mounted from ConfigMap</text>
+
+    <rect x="452" y="64" width="216" height="106" class="bx" fill="#e2eeec" stroke="#1d5c58"/>
+    <text x="560" y="88" text-anchor="middle" class="ttl" fill="#1d5c58">TIER: local</text>
+    <text x="560" y="108" text-anchor="middle" class="lbl">qwen38 · llama.cpp</text>
+    <text x="560" y="126" text-anchor="middle" class="sm">namespace qwen :8010</text>
+    <text x="560" y="146" text-anchor="middle" class="sm">27B, on one GPU, in-cluster</text>
+    <text x="560" y="162" text-anchor="middle" class="sm" fill="#1d5c58">data never leaves</text>
+
+    <rect x="452" y="214" width="216" height="136" class="bx"/>
+    <text x="560" y="238" text-anchor="middle" class="ttl">DECISION LOG</text>
+    <text x="560" y="258" text-anchor="middle" class="sm">/var/log/jev-route/</text>
+    <text x="560" y="272" text-anchor="middle" class="sm">decisions.jsonl</text>
+    <text x="560" y="292" text-anchor="middle" class="lbl">full soft distributions</text>
+    <text x="560" y="308" text-anchor="middle" class="lbl">schema-versioned</text>
+    <text x="560" y="324" text-anchor="middle" class="lbl" fill="#1d5c58">excerpt: null when blocked</text>
+    <text x="560" y="342" text-anchor="middle" class="sm">→ export → train → graduate</text>
+
+    <rect x="740" y="70" width="282" height="274" fill="none" stroke="#a83a1c" stroke-dasharray="5 4"/>
+    <text x="752" y="90" class="ttl" fill="#a83a1c">OUTSIDE THE CLUSTER · Alibaba MaaS</text>
+    <rect x="762" y="106" width="238" height="98" class="bx" fill="#f6e7e1" stroke="#a83a1c"/>
+    <text x="881" y="130" text-anchor="middle" class="ttl">TIER: cheap</text>
+    <text x="881" y="150" text-anchor="middle" class="lbl">qwen3.8-flash</text>
+    <text x="881" y="170" text-anchor="middle" class="sm">routine tasks</text>
+    <text x="881" y="190" text-anchor="middle" class="sm">$0.15 / $1.50 per Mtok</text>
+    <rect x="762" y="222" width="238" height="98" class="bx" fill="#f6e7e1" stroke="#a83a1c"/>
+    <text x="881" y="246" text-anchor="middle" class="ttl">TIER: strong</text>
+    <text x="881" y="266" text-anchor="middle" class="lbl">qwen3.8-max</text>
+    <text x="881" y="286" text-anchor="middle" class="sm">frontier reasoning</text>
+    <text x="881" y="306" text-anchor="middle" class="sm">$1.60 / $6.40 per Mtok</text>
+
+    <path class="ar" d="M148,116 H206"/>
+    <path class="ar" d="M307,170 V210"/>
+    <path class="arl" d="M402,282 H446"/>
+    <path class="arl" d="M402,240 H427 V117 H446"/>
+    <path class="are" d="M307,350 V362 H706"/>
+    <path class="are" d="M706,362 V155 H758"/>
+    <path class="are" d="M706,362 V271 H758"/>
+    <text x="500" y="392" text-anchor="middle" class="sm" fill="#a83a1c">redacted excerpt only — and only if the gate passed</text>
+  </svg>
+
+  <p class="note">
+    Deployed with <code>python deploy/k8s/deploy.py --context spark-local</code>. Two traps are handled
+    in that script and documented in <code>deploy/k8s/README.md</code>: client-side <code>kubectl apply</code>
+    cannot carry a ConfigMap this large (256&nbsp;KiB annotation cap), so it uses server-side apply; and
+    Kubernetes does not restart pods when a mounted ConfigMap changes, so the script stamps a content
+    checksum into the pod template. Without the second one, a policy edit redeploys &ldquo;successfully&rdquo;
+    and changes nothing.
+  </p>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">06</span><h2>Invariants — and where each one is pinned</h2></div>
+  <p style="max-width:80ch">
+    Each of these was written by hand, then a test was written to fail if the implementation drifted.
+    Three were later found violated by the implementation itself; the fix and the test landed together.
+    That is the only reason this table is worth printing.
+  </p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:29%">Invariant</th><th style="width:36%">Why it exists</th><th style="width:35%">Pinned by</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Gate runs first, locally, always</td>
+          <td>A model cannot be asked whether something is safe to send to a model. The floor precedes every network call.</td>
+          <td class="k">test_gate.py — gate-blocked decisions assert no backend was called</td></tr>
+      <tr><td class="k">Blocked content never reaches the log</td>
+          <td>An audit log that stores the secret it blocked is a second copy of the leak, with a longer retention period.</td>
+          <td class="k">test_logging.py — a blocked record&rsquo;s excerpt is <code>null</code>, never <code>""</code>; the two are distinguishable</td></tr>
+      <tr><td class="k">The floor cannot be outvoted</td>
+          <td>Stage 5 merges by maximum. A model saying &ldquo;public&rdquo; must not cancel a deterministic &ldquo;regulated&rdquo;.</td>
+          <td class="k">router.py stage 5 · invariant test on <code>bump_within</code></td></tr>
+      <tr><td class="k">Advisory topics are not PII</td>
+          <td>Collapsing the two air-gaps every compliance question anyone ever asks, which is how teams turn the gate off.</td>
+          <td class="k">gate.py <code>advisory=True</code> · <code>assert_routing</code> in verify_routing.py, run against the live cluster</td></tr>
+      <tr><td class="k">Exactly one module names the endpoint</td>
+          <td>Makes &ldquo;delete this file and the cloud dependency is gone&rdquo; literally true rather than aspirational.</td>
+          <td class="k">egress-boundary test: <code>grep -r api.typesafe.ai src/</code> returns one file</td></tr>
+      <tr><td class="k">Fail closed</td>
+          <td>A backend outage degrades to maximum uncertainty, which the escalation stage resolves upward to the safest tier.</td>
+          <td class="k">test_router.py outage path · <code>on_error: safest</code></td></tr>
+      <tr><td class="k">Full distributions, not labels</td>
+          <td>An argmax label cannot teach a student how sure the teacher was. This is what makes the log a dataset.</td>
+          <td class="k">test_schema.py — every soft target sums to 1.0 ± 1e-9</td></tr>
+      <tr><td class="k">Cache stores judgements, not decisions</td>
+          <td>Otherwise a policy change is frozen behind the cache and silently ignored for exactly the traffic that hit it.</td>
+          <td class="k">cache.py returns <code>BackendResult</code> · test_cache.py</td></tr>
+      <tr><td class="k">The CLI exits nonzero on a real failure</td>
+          <td>An earlier smoke test printed PASS unconditionally — it parsed an error body and checked a substring that appeared in the error text.</td>
+          <td class="k">verify_routing.py <code>assert_routing()</code> · decision-log assertions, not HTTP status</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <div class="hdr"><span class="secnum">07</span><h2>The honest trade, and the honest limits</h2></div>
+
+  <div class="grid g2">
+    <div class="box egress">
+      <div class="box-t">Safety costs accuracy, and the knob is measured</div>
+      <p>
+        On the same 223 prompts with uncertainty escalation <strong>on</strong>: tier accuracy 72.2%,
+        11 privacy violations. <strong>Off</strong>: accuracy 83.4%, 23 violations. Escalation buys a
+        52% reduction in violations &mdash; 23 down to 11 &mdash; for 11.2 points of accuracy. That is
+        the price of the safety property, stated plainly.
+      </p>
+      <p style="margin-top:9px">
+        The threshold <code>force_local_confidence_below: 0.25</code> was not chosen by taste. A sweep
+        over the real certainty distribution shows every value above 0.25 has a negative trade; the
+        sweep is documented in the code next to the constant so the next person can re-run it rather
+        than re-litigate it.
+      </p>
+    </div>
+    <div class="box">
+      <div class="box-t">Routing is verified from the log, not the response</div>
+      <p>
+        Both cloud tiers are reasoning models; <code>qwen3.8-max</code> has taken over ten minutes on a
+        hard prompt. The hook decides and logs in a <em>pre-call</em> hook, before the upstream is
+        contacted, so the decision record is authoritative and a slow upstream cannot mask a correct
+        routing decision. Live-cluster verification: 7/7 routing, 6/6 privacy, all three tiers exercised.
+      </p>
+    </div>
+  </div>
+
+  <div class="warn" style="margin-top:18px">
+    <div class="box-t">What this does not give you</div>
+    <p>
+      The semantic layer cannot be trained on your own real sensitive traffic — that is the whole
+      point of the bootstrap paradox. So its recall on <em>your</em> data is inferred from synthetic and
+      public positives plus your clean negatives, not measured on your actual secrets. Shadow-mode
+      disagreement rates on your own traffic are the real evidence, which is precisely why shadow mode
+      exists and why promotion is gated on measurement. Do not read a green test suite as a claim that
+      the gate knows your data.
+    </p>
+    <p style="margin-top:9px">
+      Equally: 72.2% tier accuracy against a 223-prompt labelled set is a small-sample measurement
+      with a wide confidence interval, not a benchmark score. The privacy-violation count is the number
+      to act on, because it is a floor violation rather than a ranking error.
+    </p>
+  </div>
+
+  <div class="grid g3" style="margin-top:20px">
+    <div class="box local"><div class="box-t">Works today</div>
+      <p>Full request path, policy engine, decision log, CLI (including the two-track
+      <code>graduate</code> and <code>label-sensitivity</code>), all three LiteLLM integration
+      modes, the offline eval harness with its rendered report, live cluster deployment and
+      verification, the graduation chain
+      <code>export → train → evaluate → package → graduate</code>, the two-layer gate with
+      blocked-request metadata logging (<code>gate-blocks.jsonl</code> beside the decision log),
+      and the synthetic sensitivity dataset builder with its fakeness-checked generator.</p></div>
+    <div class="box"><div class="box-t">What is still ahead</div>
+      <p>Your own traffic. Everything above runs offline against fixtures and the shipped eval set;
+      the cutover itself waits for a real decision log &mdash; see the refusal box, which is the
+      correct behaviour until that happens.</p></div>
+    <div class="box egress"><div class="box-t">Refuses, by design</div>
+      <p><code>graduate</code> runs the whole chain offline and answers <strong>NOT READY</strong> on the
+      223-decision teacher log: 47.6% tier agreement against a 0.95 floor, ECE 0.28 against 0.10,
+      48 held-out rows against a 500 minimum. Exit 1, nothing written. Graduation is wired end to end
+      and says no until there is enough real logged traffic — which is the only acceptable behaviour
+      for a gate on the cutover path.</p></div>
+  </div>
+
+  <p class="note" style="margin-top:26px">
+    Repo <code>/Users/jalapeno/jev-route</code> · Apache-2.0 · runs end to end with
+    <code>MockBackend</code> and no API key · <code>cd /Users/jalapeno/jev-route &amp;&amp; PYTHONPATH=src .venv/bin/python</code><br>
+    Generated from the implementation, not from a design document that preceded it. Where this page and
+    the code disagree, the code is right and this page has a bug.
+  </p>
+</section>
+
+</div>
+</body>
+</html>

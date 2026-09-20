@@ -1,0 +1,192 @@
+# jev-route + LiteLLM proxy -- mode 2: the native complexity router.
+#
+#   PYTHONPATH=src .venv/bin/litellm --config examples/litellm-proxy-classifier/config.yaml --port 4000
+#   curl localhost:4000/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+#        -H 'content-type: application/json' \
+#        -d '{"model":"auto","messages":[{"role":"user","content":"Summarize this patient record: ..."}]}'
+#
+# How it works: `auto` is an auto_router/complexity_router deployment. LiteLLM
+# asks jev-route's ClassifierPlugin for a TIER NAME, then its own tier machinery
+# picks the deployment, handles cooldowns, fallbacks and load balancing. jev-route
+# supplies the judgement; LiteLLM keeps every consequence of it.
+#
+# Every decision is also appended to jev-route's own JSONL log (policy
+# `logging.path`, overridable with JEV_ROUTE_DECISION_LOG) with the full soft
+# probability distributions -- that file is the training set the distillation
+# step reads later. The tier name in this config and the tier names in the policy
+# file must agree; if they drift, the classifier declines and `fallback_tier`
+# decides, and jev-route logs one warning rather than one per request.
+#
+# Backends below are real and reachable from this machine:
+#   local  - llama.cpp serving Qwen3.8-27B on a DGX Spark. Data never leaves.
+#   cheap  - Alibaba Model Studio (Singapore), Qwen3.8-Flash.
+#   strong - Alibaba Model Studio (Singapore), Qwen3.8-Max.
+# The API key is referenced as os.environ/ALIBABA_API_KEY and is never inlined.
+
+model_list:
+  # --- tier: local. Self-hosted, air-gapped, no key. -------------------------
+  - model_name: qwen38
+    litellm_params:
+      model: openai/qwen3.8
+      api_base: http://192.168.1.124:8010/v1
+      # llama.cpp ignores the key but litellm requires a non-empty one.
+      api_key: "EMPTY"
+
+  # --- tier: cheap -----------------------------------------------------------
+  - model_name: qwen3.8-flash
+    litellm_params:
+      model: openai/qwen3.8-flash
+      api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/ALIBABA_API_KEY
+
+  # --- tier: strong ----------------------------------------------------------
+  - model_name: qwen3.8-max
+    litellm_params:
+      model: openai/qwen3.8-max
+      api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/ALIBABA_API_KEY
+
+  # --- the router itself -----------------------------------------------------
+  - model_name: auto
+    litellm_params:
+      model: auto_router/complexity_router
+      # `complexity_router_default_model` is the spelling litellm treats as a
+      # dependency of this deployment (health checks, model graph). The
+      # `default_model` inside complexity_router_config below is the one the
+      # complexity router reads; set both, they are not interchangeable.
+      complexity_router_default_model: qwen3.8-flash
+      complexity_router_config:
+        # classifier_type: custom delegates the classification to a
+        # ClassifierPlugin. litellm resolves the dotted path with
+        # get_instance_fn: the last segment must be a module attribute holding an
+        # INSTANCE with an async `classify(context)`. A sync `classify` is
+        # rejected at startup, which is better than at first request.
+        classifier_type: custom
+        classifier_plugin: jev_route.integrations.litellm_classifier.classifier
+        # litellm cancels the plugin call at this budget and falls back.
+        # jev-route declines on its own slightly earlier (2500ms) so the reason
+        # in the log is ours rather than a TimeoutError in litellm's.
+        classifier_plugin_timeout_ms: 3000
+
+        # ---------------------------------------------------------------------
+        # WHERE THE REQUEST GOES WHEN jev-route HAS NO ANSWER.
+        #
+        # litellm's own docstring for `classifier_fallback: default_model` says:
+        #
+        #   "'default_model' skips scoring and routes to default_model, which is
+        #    what a classifier on some other taxonomy wants: a prompt that grades
+        #    data sensitivity has no use for a complexity score, and scoring one
+        #    produces a tier unrelated to what the operator configured."
+        #
+        # That sentence is describing jev-route exactly. But note the catch,
+        # verified against litellm 1.101.0: `classifier_fallback: default_model`
+        # and `tier_definitions` are MUTUALLY EXCLUSIVE. Setting both makes the
+        # proxy refuse to start with
+        #
+        #   "classifier_fallback 'default_model' cannot be combined with
+        #    tier_definitions: fallback_tier is where a custom-tier router routes
+        #    when the classifier fails"
+        #
+        # With a custom tier set, `fallback_tier` IS that knob, so this config
+        # sets fallback_tier and no classifier_fallback -- and points it at the
+        # local tier, because "the classifier could not answer" is exactly the
+        # situation in which data should not leave the building.
+        #
+        # If you would rather use litellm's built-in tier ladder
+        # (SIMPLE/MEDIUM/COMPLEX/REASONING) and `classifier_fallback:
+        # default_model`, drop `tier_definitions` and `fallback_tier`, rename the
+        # `tiers:` keys to the built-in names, and jev-route will decline every
+        # request (its tiers are local/cheap/strong) -- so also set
+        # JEV_ROUTE_CLASSIFIER_TIERS or point the policy's tiers at the built-in
+        # names. The custom tier set below is the configuration that works.
+        # ---------------------------------------------------------------------
+        fallback_tier: local
+        default_model: qwen3.8-flash
+
+        # Custom tiers. Each entry needs a non-empty `name` and a one-line
+        # `description` (no newlines -- the rubric renders one line per tier),
+        # and `tiers` below must use these names EXACTLY.
+        #
+        # These descriptions are written for an LLM complexity classifier; with
+        # classifier_type: custom they are documentation for the operator, since
+        # jev-route's own policy file (policies/default.yaml) holds the rules
+        # that actually decide. Keeping the two in sync is the operator's job,
+        # and it is worth doing: this block is what a reviewer reads first.
+        tier_definitions:
+          - name: local
+            description: Sensitive, personal, regulated or credential-bearing requests, and anything the local hard gate matched; must stay on self-hosted models.
+          - name: cheap
+            description: Routine work with no sensitivity signal - summaries, rewrites, ordinary questions, everyday code.
+          - name: strong
+            description: Hard multi-step reasoning, proofs, architecture with real tradeoffs, debugging under incomplete information.
+
+        # Tier -> model_name pools from the model_list above. litellm load
+        # balances inside a pool, so a tier may list several deployments.
+        tiers:
+          local:
+            - qwen38
+          cheap:
+            - qwen3.8-flash
+          strong:
+            - qwen3.8-max
+
+        # ---------------------------------------------------------------------
+        # WHAT A CUSTOM TIER SET COSTS YOU, stated plainly so nobody hunts for
+        # the missing features later. With `tier_definitions` set, litellm
+        # rejects: adaptive routing, session_affinity, escalation_keywords,
+        # stall_escalation, tier_labels, a replacement classifier system_prompt
+        # or classification_rubric, and `classifier_fallback: default_model`.
+        # (An empty `plugins` list is accepted; a non-empty one is rejected.)
+        #
+        # None of those are losses here, because jev-route does the same jobs in
+        # its own policy engine and does them on evidence rather than on retries:
+        #   escalation  -> `on_uncertain` bumps complexity AND sensitivity
+        #                  *stricter* when the backend's confidence is low. An
+        #                  argmax classifier cannot express that at all.
+        #   stickiness  -> the decision cache (identical redacted excerpts skip
+        #                  the backend), plus the local hard gate, which is
+        #                  deterministic and therefore perfectly sticky.
+        #   fallback    -> `on_backend_down: fail_closed` plus a circuit breaker.
+        # ---------------------------------------------------------------------
+
+litellm_settings:
+  # Pass through provider params litellm does not recognise rather than 400ing.
+  drop_params: true
+  # Set this to see jev-route's own warnings inline with litellm's.
+  set_verbose: false
+
+# Note on auth, learned the hard way while verifying this file: with
+# `general_settings.master_key` set, a caller must send that exact key. Any other
+# key makes LiteLLM look it up in its virtual-key store, and with no
+# `DATABASE_URL` the request fails with `{"error":{"message":"No connected db."}}`
+# -- a 400 that has nothing to do with jev-route. Set DATABASE_URL if you want
+# virtual keys; otherwise send the master key.
+general_settings:
+  # Never inline a master key either. Any value works for a local run.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# ONE LIMITATION OF THIS MODE, verified against a running LiteLLM 1.101 proxy:
+# the RoutingContext a classifier plugin receives carries 51 metadata keys and
+# none of them is `litellm_call_id`. jev-route therefore stamps its own
+# request_id on the decision record, and that record CANNOT be joined back to
+# LiteLLM's spend-log row for the same request. If that join matters to you ("which
+# decisions belonged to the slow requests, and what did they cost"), use
+# examples/litellm-proxy-hook/config.yaml instead: the pre-call hook sees the whole
+# request body and does pick up litellm_call_id. What this mode gives you in
+# exchange is LiteLLM's own tier machinery -- cooldowns, fallbacks and load
+# balancing inside the chosen tier.
+#
+# Run the proxy with --detailed_debug and jev-route logs the key names (never the
+# values) it was handed, so you can see for yourself what your LiteLLM version
+# exposes: "jev-route: classifier context metadata keys: [...]".
+
+# Environment for this example:
+#   export PYTHONPATH=/path/to/jev-route/src      # or: pip install -e .
+#   export JEV_ROUTE_POLICY=/path/to/jev-route/policies/default.yaml
+#   export ALIBABA_API_KEY=...                    # for the cheap/strong tiers
+#   export TYPESAFE_API_KEY=...                   # only if the policy says backend.name: jev
+#   export JEV_ROUTE_DECISION_LOG=/var/log/jev-route/decisions.jsonl   # optional
+#
+# Without TYPESAFE_API_KEY the shipped policy runs on the deterministic
+# MockBackend: coarse judgements, no network, no cost, and the pipeline still
+# exercises every stage. That is the intended offline path, not a degraded one.

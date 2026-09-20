@@ -1,0 +1,55 @@
+skinparam backgroundColor #FDFBF7
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #443F37
+skinparam sequence {
+  ParticipantBorderColor #1D5C58
+  ParticipantBackgroundColor #E2EEEC
+  LifeLineBorderColor #1D5C58
+  NoteBackgroundColor #FBF3EC
+  NoteBorderColor #A83A1C
+}
+skinparam rectangle {
+  BorderColor #443F37
+  BackgroundColor #FDFBF7
+}
+skinparam component {
+  BorderColor #1D5C58
+  BackgroundColor #E2EEEC
+  FontColor #1A1917
+}
+skinparam shadowing false
+@startuml
+title Graduation — from Jev's decisions to your own model
+
+start
+partition "bootstrap (cloud phase)" {
+  :route on Jev (or the teacher);
+  :decision log fills up — every decision with its\nfull soft distribution;
+  :jev-route log-stats;
+  :export (text or features mode);
+  :train — KL distillation over soft targets;
+  :evaluate — tier agreement, ECE, latency;
+  :package — six-file artifact, checksummed;
+}
+partition "router track" {
+  if (readiness gates pass?\n(tier agreement, ECE, latency, samples)) then (yes)
+    :graduate --write — new policy:\ndistilled primary + teacher shadow;
+    :run the shadow, watch disagreement;
+    :cut over: backend.name: distilled;
+    :delete the cloud key — egress stops;
+    stop
+  else (no)
+    :NOT READY — exit 1, nothing written;
+    stop
+  endif
+}
+partition "gate track (separate criteria)" {
+  :fit the semantic layer on the sensitivity dataset\n(synthetic + public positives, cleared negatives);
+  :run shadow on live traffic (min 1000 examples);
+  if (measured criteria pass?\n(recall, FPR, disagreement, misses)) then (yes)
+    :graduate --track gate --write —\nenforce, carrying shadow_metrics in the policy;
+  else (no)
+    :stays in shadow — the numbers are printed;
+  endif
+}
+@enduml

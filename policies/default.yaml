@@ -1,0 +1,216 @@
+# jev-route default policy
+#
+# This file is the operator's surface. Everything here is read at startup,
+# validated, and then evaluated per request without touching code.
+#
+# The ordering of `rules` is the whole game: first match wins. The defaults below
+# put data protection before cost, because a router that saves money by leaking a
+# patient record has not saved anything.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Decision backend. Swap this one key to graduate from cloud to local.
+#   mock      - deterministic, offline, no API key. Development and CI.
+#   jev       - TypeSafe cloud. Day one: calibrated, zero training data.
+#   distilled - a model trained from your own decision log. Air-gapped end state.
+#   shadow    - run two backends, serve one, log disagreements. The cutover path.
+# ---------------------------------------------------------------------------
+backend:
+  name: mock
+  # jev:
+  #   api_key_env: TYPESAFE_API_KEY
+  #   model: jev-latest
+  #   timeout_seconds: 5.0
+  #   max_retries: 2
+  #   include_domain: true
+  # distilled:
+  #   artifact: ./artifacts/jev-route-distilled
+  # shadow:
+  #   primary: distilled
+  #   shadow: jev
+  #   log_disagreements: true
+
+# ---------------------------------------------------------------------------
+# The local hard gate. Runs FIRST, always locally, and is never bypassed.
+# It can only make a decision stricter, and for credential material and
+# regulated identifiers it refuses to let the excerpt reach a remote backend at
+# all. See src/jev_route/gate.py for the detector list.
+# ---------------------------------------------------------------------------
+gate:
+  # skip_backend  - when the gate already forces local, do not pay for a cloud
+  #                 classification. Fastest, cheapest, and nothing leaves.
+  # still_classify - call the backend anyway (on the redacted excerpt) so the
+  #                 decision log carries complexity/domain labels for these
+  #                 prompts too. Better distillation coverage; more egress.
+  on_force_local: skip_backend
+  disabled_detectors: []
+  placeholder_domains_as_pii: false
+
+  # Refusal telemetry. When the gate blocks a request, this stream records which
+  # detectors fired, the deterministic feature vector, and the excerpt hash --
+  # never the text, never a matched span. It exists so an operator can improve the
+  # rules ("this detector never fires", "nothing covers this shape of prompt")
+  # without asking the user to paste a blocked prompt again. Written to its own
+  # file next to the decision log so no training export can sweep it up: it feeds
+  # rule improvement, not model training.
+  blocked_metadata:
+    enabled: true
+    # path: ./decision-log/gate-blocks.jsonl   # default: sibling of logging.path
+
+  # Layer 2 of the gate: a LOCAL semantic sensitivity model that catches contextual
+  # sensitivity regex cannot see -- an HR disciplinary narrative, a clinical note
+  # in prose, a privilege discussion. It can only make routing stricter, and layer
+  # 1 above remains the compliance floor whatever this says.
+  #
+  # shadow  - runs, scores, logs disagreements with layer 1, and NEVER blocks.
+  #           This is the default, and it is inert until an artifact exists.
+  # enforce - may raise the sensitivity floor and force the local tier. The flag is
+  #           necessary and NOT sufficient: the artifact's measured held-out metrics
+  #           must also satisfy enforce_requires, or the router refuses to start and
+  #           prints the numbers. It never silently downgrades to shadow.
+  semantic:
+    mode: shadow
+    # artifact: ./artifacts/gate-semantic        # directory holding semantic.json
+    threshold: 0.5
+    level: confidential                          # floor asserted when it fires
+    # Measured from the live shadow log (measure_shadow_log over decisions.jsonl).
+    # shadow_metrics: ./artifacts/gate-semantic/shadow-metrics.json
+    enforce_requires:
+      min_recall: 0.99               # held-out synthetic/public positives caught
+      max_false_positive_rate: 0.02  # real negatives it would have air-gapped
+      max_disagreement_rate: 0.05    # live shadow traffic contradicting layer 1
+      max_semantic_miss_rate: 0.02   # rows layer 1 caught that layer 2 missed
+      min_positive_examples: 200     # held-out sample sizes; a tiny eval set
+      min_negative_examples: 500     # manufactures a promotion
+      min_shadow_examples: 1000      # real requests observed in shadow first
+
+# ---------------------------------------------------------------------------
+# Tiers map to concrete LiteLLM model names from your config.yaml model_list.
+# `local` means "self-hosted, data never leaves the building".
+# ---------------------------------------------------------------------------
+tiers:
+  local:
+    - qwen38
+  cheap:
+    - qwen3.8-flash
+  strong:
+    - qwen3.8-max
+# Ascending capability. This order is what tier promotion and `fail_open_tier` read;
+# `on_uncertain` does not bump tiers -- it bumps sensitivity/complexity labels (below).
+tier_order: [cheap, strong]
+
+pii_threshold: 0.5
+
+# ---------------------------------------------------------------------------
+# Rules. First match wins.
+# ---------------------------------------------------------------------------
+rules:
+  # 1. The local gate's hard findings. This rule is belt-and-braces: the router
+  #    already merges the gate floor into `sensitivity` before rules run, so
+  #    removing it would still not route a card number to a frontier model.
+  - id: gate.force-local
+    if: gate_force_local
+    then:
+      tier: local
+    reason: local hard gate matched a structured identifier or credential
+
+  # 2. Regulated or confidential data stays on self-hosted models. Complexity is
+  #    deliberately irrelevant here: a hard task on regulated data is still
+  #    regulated. (Add a `local-strong` tier if you need capability on-prem.)
+  - id: data.sensitive
+    if: sensitivity in ["confidential", "regulated"] or pii_present
+    then:
+      tier: local
+    reason: sensitive or personal data must not leave the infrastructure
+
+  # 3. Capability-driven routing. Only reached once data protection is satisfied.
+  - id: complexity.frontier
+    if: complexity == "frontier"
+    then:
+      tier: strong
+    reason: task needs frontier-class reasoning
+
+  - id: complexity.hard
+    if: complexity == "hard"
+    then:
+      tier: strong
+    reason: task needs a strong model
+
+  # 4. Everything else goes to the cheapest tier that can do it.
+  - id: default
+    then:
+      tier: cheap
+    reason: routine task, no sensitivity signal
+
+# ---------------------------------------------------------------------------
+# Uncertainty-as-code. When the backend is not sure, the answer gets stricter,
+# never looser. This is the behaviour an argmax classifier cannot express.
+# ---------------------------------------------------------------------------
+on_uncertain:
+  sensitivity_confidence_below: 0.8
+  sensitivity_bump_levels: 1
+  complexity_confidence_below: 0.7
+  complexity_bump_levels: 1
+  # A noul near 0.5 is a coin flip, not a "no". Treating an uncertain PII
+  # judgement as "present" is the fail-safe reading.
+  pii_uncertain_threshold: 0.35
+  pii_uncertain_counts_as_present: true
+  # Below this, stop bumping one level at a time and keep the request local.
+  # `confidence` is normalized-entropy CERTAINTY, not the top probability, so a
+  # 0.63/0.34 split scores about 0.28 -- which is why this number looks low.
+  # 0.25 is the highest value with a non-negative trade on the shipped eval set:
+  # it fixes a leak without air-gapping any legitimate cloud row. Raising it to
+  # 0.5 fixes two more leaks and needlessly localizes ~13% of cloud traffic.
+  # See UncertaintyPolicy.force_local_confidence_below for the full sweep.
+  force_local_confidence_below: 0.25
+
+# ---------------------------------------------------------------------------
+# Backend outage. fail_closed -> safest tier (data stays local).
+# fail_open -> most capable tier (answer quality is the risk you care about).
+# ---------------------------------------------------------------------------
+on_backend_down:
+  mode: fail_closed
+  fail_closed_tier: local
+  fail_open_tier: strong
+
+# ---------------------------------------------------------------------------
+# Decision cache. Identical redacted excerpts skip the backend entirely, which
+# is the main defence against the routing latency tax on repetitive traffic.
+# ---------------------------------------------------------------------------
+cache:
+  enabled: true
+  # kind: memory            # memory | redis (default memory; redis needs the
+  #                          # [redis] extra and a url)
+  ttl_seconds: 900
+  max_entries: 8192
+
+# ---------------------------------------------------------------------------
+# Decision log. THIS IS THE TRAINING DATASET. Treat it accordingly.
+#   excerpt_mode:
+#     hash     - default. Hash + deterministic features only. No prompt text is
+#                retained. Distillation is limited to feature-based models.
+#     redacted - store the redacted excerpt. Enables text-based distillation
+#                (ModernBERT-class). Gate-blocked requests are NEVER stored as
+#                text, regardless of this setting.
+#     none     - no excerpt field at all.
+# ---------------------------------------------------------------------------
+logging:
+  enabled: true
+  path: ./decision-log/decisions.jsonl
+  excerpt_mode: hash
+  hash_salt: ""
+  # Rotate at this many bytes; 0 disables rotation.
+  max_bytes: 268435456
+  flush_every: 1
+
+# ---------------------------------------------------------------------------
+# Shadow mode: serve one backend's decision while another runs alongside, and
+# log where they disagree. This is how `jev-route graduate` earns the cutover.
+# ---------------------------------------------------------------------------
+shadow:
+  enabled: false
+  # primary: distilled
+  # shadow: jev
+  # log_disagreements: true
+  # sample_rate: 1.0

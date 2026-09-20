@@ -1,0 +1,74 @@
+skinparam backgroundColor #FDFBF7
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #443F37
+skinparam sequence {
+  ParticipantBorderColor #1D5C58
+  ParticipantBackgroundColor #E2EEEC
+  LifeLineBorderColor #1D5C58
+  NoteBackgroundColor #FBF3EC
+  NoteBorderColor #A83A1C
+}
+skinparam rectangle {
+  BorderColor #443F37
+  BackgroundColor #FDFBF7
+}
+skinparam component {
+  BorderColor #1D5C58
+  BackgroundColor #E2EEEC
+  FontColor #1A1917
+}
+skinparam shadowing false
+@startuml
+title The request path — eight steps in a fixed order
+
+actor "Client" as C
+participant "prompts.py\nexcerpt" as E
+participant "gate.py\nlayer 1 (deterministic)" as G1
+participant "gate_semantic.py\nlayer 2 (semantic)" as G2
+participant "cache.py" as K
+participant "backend\njev | mock | distilled | shadow" as B
+participant "policy.py\nrules + escalation" as P
+participant "logging_sink.py\ndecisions.jsonl" as L
+
+C -> E : request (messages or text)
+activate E
+E --> E : bounded slice, max 4000 chars
+deactivate E
+
+E -> G1 : scan(**raw** excerpt)
+activate G1
+G1 --> G1 : 22 detectors: Luhn, IBAN mod-97,\nNHS mod-11, NINO rules, ...
+G1 --> E : GateVerdict (findings, floors,\nforce_local, blocks_backend)
+deactivate G1
+
+E -> G2 : assess(**raw** excerpt) — local, no network
+activate G2
+G2 --> G2 : shadow: scores + records, never blocks\nenforce: may raise floor, only on\nmeasured criteria
+G2 --> E : SemanticAssessment
+deactivate G2
+
+note over E
+  **TRUST BOUNDARY** — if either layer blocks, nothing
+  crosses. Otherwise only the *redacted* excerpt +
+  deterministic features + allowlisted metadata may go.
+end note
+
+E -> K : lookup (policy version, backend, redacted excerpt, topics)
+alt cache miss
+  K -> B : decide(4 questions)
+  activate B
+  B --> K : calibrated soft distributions
+  deactivate B
+else cache hit
+  K --> E : stored judgement (re-reasoned under current policy)
+end
+
+E -> P : merge floors (max, never min)
+activate P
+P --> P : escalate on low confidence (only upward)
+P --> E : tier + model (first matching rule)
+deactivate P
+
+E -> L : DecisionRecord — full soft distributions,\nnot just the argmax. This is the training set.
+E --> C : routed to tier/model
+@enduml

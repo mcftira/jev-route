@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Generate the Kubernetes ConfigMaps that carry jev-route into the cluster.
+
+Two ConfigMaps come out of this:
+
+``jev-route-code``
+    Every ``.py`` under ``src/jev_route`` as one key, flattened with ``__``
+    (ConfigMap keys cannot contain ``/``). The Deployment maps each key back to its
+    real path with ``items[].path``, so the package directory structure survives.
+
+``jev-route-policy``
+    The routing policy, mounted at ``/app/policies/default.yaml`` where
+    ``JEV_ROUTE_POLICY`` points.
+
+Shipping source in a ConfigMap instead of baking an image is a deliberate trade for
+a self-hosted single-node cluster: no registry, no build step, no arm64 image bake,
+and the deployed code is inspectable with one kubectl command. The ceiling is the
+1 MiB ConfigMap limit -- this script fails loudly rather than silently truncating
+if the package ever grows past it. For production, build an image with
+``pip install jev-route[litellm]`` and drop the code ConfigMap entirely.
+
+Usage:
+    python3 deploy/k8s/build_configmap.py [--policy deploy/k8s/policy-cluster.yaml] \\
+                                          [--out deploy/k8s/15-generated.yaml]
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import yaml
+
+# Kubernetes limit. The whole ConfigMap, all keys, base64 aside.
+CONFIGMAP_MAX_BYTES = 1_048_576
+
+REPO = Path(__file__).resolve().parents[2]
+SRC = REPO / "src" / "jev_route"
+
+#: Modules the proxy never needs. Keeping them out saves bytes and, more
+#: importantly, keeps heavy optional dependencies (numpy, torch) off the import
+#: path of a container that does not have them installed.
+EXCLUDE_PARTS = frozenset({"distill"})
+
+
+def collect_modules(root: Path) -> dict[str, str]:
+    """Map flattened ConfigMap key -> (relative path, source text)."""
+    if not root.exists():
+        sys.exit(f"error: package source not found at {root}")
+    out: dict[str, tuple[str, str]] = {}
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if EXCLUDE_PARTS & set(rel.parts):
+            continue
+        key = str(rel).replace("/", "__")
+        out[key] = (str(rel).replace("\\", "/"), path.read_text(encoding="utf-8"))
+    if not out:
+        sys.exit(f"error: no python modules found under {root}")
+    return out  # type: ignore[return-value]
+
+
+def items_for(modules: dict[str, tuple[str, str]]) -> list[dict[str, str]]:
+    """volume.items entries that restore the package layout on mount."""
+    return [{"key": key, "path": rel} for key, (rel, _src) in sorted(modules.items())]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--policy",
+        default=str(REPO / "deploy" / "k8s" / "policy-cluster.yaml"),
+        help="jev-route policy file to ship",
+    )
+    parser.add_argument(
+        "--out",
+        default=str(REPO / "deploy" / "k8s" / "15-generated.yaml"),
+        help="where to write the generated manifests",
+    )
+    parser.add_argument("--namespace", default="jev-route")
+    args = parser.parse_args()
+
+    modules = collect_modules(SRC)
+    policy_path = Path(args.policy)
+    if not policy_path.exists():
+        sys.exit(f"error: policy file not found at {policy_path}")
+
+    # Validate the policy before it goes anywhere near a cluster. A typo here
+    # otherwise surfaces as a CrashLoopBackOff with a litellm traceback.
+    sys.path.insert(0, str(REPO / "src"))
+    from jev_route.policy import Policy
+
+    Policy.from_file(policy_path)
+
+    data = {key: src for key, (_rel, src) in modules.items()}
+    payload = yaml.safe_dump(data, default_style="|", allow_unicode=True)
+    size = len(payload.encode("utf-8"))
+    if size > CONFIGMAP_MAX_BYTES:
+        sys.exit(
+            f"error: code ConfigMap would be {size} bytes, over the {CONFIGMAP_MAX_BYTES} "
+            f"Kubernetes limit. Build an image instead of mounting source."
+        )
+
+    code_cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "jev-route-code",
+            "namespace": args.namespace,
+            "labels": {"app.kubernetes.io/name": "jev-route", "app.kubernetes.io/component": "package"},
+            "annotations": {
+                "jev-route/module-count": str(len(modules)),
+                "jev-route/bytes": str(size),
+            },
+        },
+        "data": data,
+    }
+    policy_cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "jev-route-policy",
+            "namespace": args.namespace,
+            "labels": {"app.kubernetes.io/name": "jev-route", "app.kubernetes.io/component": "policy"},
+        },
+        "data": {"default.yaml": policy_path.read_text(encoding="utf-8")},
+    }
+
+    out = Path(args.out)
+    out.write_text(
+        "# GENERATED by deploy/k8s/build_configmap.py -- do not edit by hand.\n"
+        "# Regenerate after any change to src/jev_route or the cluster policy.\n"
+        + yaml.safe_dump_all([code_cm, policy_cm], sort_keys=False, allow_unicode=True, width=10**6),
+        encoding="utf-8",
+    )
+
+    # The Deployment needs items[] to restore subdirectories; emit it as a patch
+    # file so `kubectl apply -k` is not required.
+    patch = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "jev-route-code", "namespace": args.namespace},
+    }
+    items_path = out.with_name("16-code-volume-items.yaml")
+    items_path.write_text(
+        "# GENERATED. Mount spec for the code ConfigMap: each flattened key maps back\n"
+        "# to its real path inside the package. Consumed by deploy/k8s/deploy.py.\n"
+        + yaml.safe_dump({"items": items_for(modules)}, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    print(f"wrote {out.relative_to(REPO)} ({len(modules)} modules, {size} bytes)")
+    print(f"wrote {items_path.relative_to(REPO)} ({len(modules)} items)")
+    print(f"policy validated: {policy_path.relative_to(REPO)}")
+    del patch
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,72 @@
+# LiteLLM proxy configuration for jev-route.
+#
+# Three tiers, matching policies/default.yaml:
+#   local  -> qwen38        self-hosted llama.cpp on the DGX Spark GPU. Data never leaves.
+#   cheap  -> qwen3.8-flash Alibaba Cloud Model Studio
+#   strong -> qwen3.8-max   Alibaba Cloud Model Studio
+#
+# The jev-route pre-call hook is registered under litellm_settings.callbacks and
+# rewrites data["model"] before the call, so ordinary OpenAI-compatible clients
+# need no changes at all: they ask for `auto` and get the tier they earned.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jev-route-litellm-config
+  namespace: jev-route
+  labels:
+    app.kubernetes.io/name: jev-route
+data:
+  config.yaml: |
+    model_list:
+      # --- the router alias clients actually call -------------------------
+      - model_name: auto
+        litellm_params:
+          model: openai/qwen3.8-flash
+          api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+          api_key: os.environ/ALIBABA_API_KEY
+        model_info:
+          description: jev-route managed alias; the pre-call hook rewrites this per request
+
+      # --- tier: local (self-hosted, DGX Spark GPU) -----------------------
+      - model_name: qwen38
+        litellm_params:
+          model: openai/qwen3.8
+          api_base: http://qwen.qwen.svc.cluster.local:8010/v1
+          api_key: "EMPTY"
+          extra_body:
+            temperature: 0.7
+            top_p: 0.95
+        model_info:
+          description: local Qwen3.8-27B via llama.cpp; sensitive data stays on-prem
+
+      # --- tier: cheap (frontier, fast) -----------------------------------
+      - model_name: qwen3.8-flash
+        litellm_params:
+          model: openai/qwen3.8-flash
+          api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+          api_key: os.environ/ALIBABA_API_KEY
+
+      # --- tier: strong (frontier flagship) -------------------------------
+      - model_name: qwen3.8-max
+        litellm_params:
+          model: openai/qwen3.8-max
+          api_base: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+          api_key: os.environ/ALIBABA_API_KEY
+
+    litellm_settings:
+      drop_params: true
+      request_timeout: 600
+      num_retries: 1
+      # jev-route integration mode 3: a CustomLogger whose async_pre_call_hook
+      # rewrites data["model"]. The dotted path resolves to a module-level
+      # instance; /app is on PYTHONPATH so `jev_route` imports cleanly.
+      callbacks: jev_route.integrations.litellm_hook.proxy_handler_instance
+
+    router_settings:
+      # If the local model is ever down, sensitive traffic must NOT silently fall
+      # through to a cloud model. There is deliberately no fallback from qwen38.
+      fallbacks:
+        - qwen3.8-max: ["qwen3.8-flash"]
+
+    general_settings:
+      master_key: os.environ/JEV_ROUTE_MASTER_KEY
