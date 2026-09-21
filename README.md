@@ -3,6 +3,8 @@ BADGE NOTE: the PyPI badge below is commented out until the first release is
 published. Uncomment it (and delete this comment) once `jev-route` is on PyPI.
 -->
 
+![jev-route](docs/banner.jpg)
+
 # jev-route
 
 **Run it. Log it. Distill it. Own it.**
