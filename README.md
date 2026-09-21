@@ -30,7 +30,7 @@ plus a PII judgement and a task domain, and it does so with *calibrated confiden
 "I'm 62% sure this is internal" is a routable fact rather than a shrug.
 
 ```text
-                       ┌──────────────────────────────────────────────┐
+                      ┌───────────────────────────────────────────────┐
    request  ───────►  │ 1. excerpt                                    │
                       │ 2. LOCAL GATE — two local layers:             │
                       │     layer 1 is deterministic and              │
@@ -44,7 +44,7 @@ plus a PII judgement and a task domain, and it does so with *calibrated confiden
                       │ 7. evaluate policy → tier + model             │
                       │ 8. LOG the whole thing, soft probs            │
                       │               included                        │
-                       └──────────────────────────────────────────────┘
+                      └───────────────────────────────────────────────┘
                                              │
                                              ▼
                               decision-log/decisions.jsonl
