@@ -470,6 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         p.add_argument("-v", "--verbose", action="store_true")
 
+    p = sub.add_parser("backtest", help="replay a request trace through a policy and measure cost delta")
+    p.add_argument("--trace", required=True, help="JSONL trace (e.g. traces/demo_500.jsonl)")
+    p.add_argument("--policy", default="policies/default.yaml")
+    p.add_argument("--report", default=None, help="write a markdown report here (else print summary)")
+    p.set_defaults(func=_cmd_backtest)
+
     p = sub.add_parser("route", help="route one prompt and print the decision")
     p.add_argument("text", nargs="?", default=None, help="prompt text (or pipe it on stdin)")
     p.add_argument("--metadata", default=None, help="JSON object of caller metadata")
@@ -601,6 +607,26 @@ def _version() -> str:
         return __version__
     except Exception:
         return "unknown"
+
+
+def _cmd_backtest(args: Any) -> int:
+    import asyncio
+
+    from .backtest import render_report, run_backtest
+    from .policy import Policy
+
+    policy = Policy.from_file(args.policy)
+    report = asyncio.run(run_backtest(trace_path=args.trace, policy=policy))
+    if args.report:
+        from pathlib import Path
+
+        Path(args.report).write_text(render_report(report, trace_path=args.trace, policy_name=args.policy))
+        print(f"report written to {args.report}")
+    print(
+        f"{report.total} requests | ours ${report.cost_ours:.4f} vs baseline ${report.cost_baseline:.4f} "
+        f"| savings {report.savings_pct:.1f}% | gate fires {report.gate_fires} | tiers {report.by_tier}"
+    )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

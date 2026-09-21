@@ -491,6 +491,10 @@ class RoutingDecision:
     degrade_reason: str | None = None
     latency_ms: float = 0.0
     cached: bool = False
+    #: True when backend confidence fell below the policy floor and the route
+    #: was diverted to the uncertain fallback: the decision log doubles as a
+    #: human-review queue instead of silently accepting shaky routes.
+    uncertain: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -509,6 +513,7 @@ class RoutingDecision:
             "degrade_reason": self.degrade_reason,
             "latency_ms": self.latency_ms,
             "cached": self.cached,
+            "uncertain": self.uncertain,
         }
 
 

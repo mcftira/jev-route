@@ -58,8 +58,42 @@ plus a PII judgement and a task domain, and it does so with *calibrated confiden
 
 ---
 
+## v0.2: hardening + measured numbers
+
+v0.2 hardens the routing chain with three changes, and each one is a file you can open. The
+**tier prefilter** (`src/jev_route/prefilter.py`) is deterministic and runs *before any model
+call*: it rules out the tiers that could never serve the request, and when exactly one tier
+survives, routing is free — the backend call is skipped and the decision is logged with
+`backend: "prefilter"`, so the distill pipeline sees it like any other decision. Pinned-model
+routing is a strict opt-in: only with `routing.bypass_on_pinned: true` (default off) does an
+explicit model pin bypass the router. And uncertainty is marked, not swallowed: a decision
+below `routing.min_confidence` gets `uncertain: true`, and the request is diverted to
+`routing.uncertain_fallback` — the decision log doubles as a human review queue.
+
+The measured numbers, each tied to the file that produces it:
+
+| result | number | source |
+| --- | --- | --- |
+| cost vs always-frontier | **92.3% cheaper** on a 500-request synthetic trace | [`docs/backtest_v0.2.md`](docs/backtest_v0.2.md) |
+| injection wrappers + authority framing | **0 leaks** on 120 attack cases | [`evals/injection/RESULTS.md`](evals/injection/RESULTS.md) |
+| benign controls | **0 false positives** on 104 cases | [`evals/injection/RESULTS.md`](evals/injection/RESULTS.md) |
+| encoding tricks (base64, spaced, typo'd Hungarian PII) | **25 documented leaks**, of 40 cases | [`evals/injection/RESULTS.md`](evals/injection/RESULTS.md) |
+
+The last row is the point, not a bug to hide: a regex-class gate cannot read base64 or a
+typo'd identifier, and every one of those 25 leaks is written down in the results file as a
+requirement for the distilled semantic layer. The threat model behind the eval:
+[docs/privacy.md](docs/privacy.md).
+
+Reproduce — both commands are keyless:
+
+```bash
+python -m jev_route.cli backtest --trace traces/demo_500.jsonl
+python evals/injection/run.py
+```
+
 ## Contents
 
+- [v0.2: hardening + measured numbers](#v02-hardening--measured-numbers)
 - [Why routing needs calibration](#why-routing-needs-calibration)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Bootstrap on Jev](#bootstrap-on-jev)

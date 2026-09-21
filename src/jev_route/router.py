@@ -74,6 +74,24 @@ from .schema import (
 _GATE_OVERRIDES_FAIL_OPEN = ("confidential", "regulated")
 
 
+_BYPASS_MODEL_NAMES = frozenset({"jev-route/auto", "auto", ""})
+
+
+def _is_bypass(requested_model: str | None, policy: Policy) -> bool:
+    """Pinned-model or routing-off pass-through (Jevonian's bypass rule).
+
+    ``requested_model`` in this codebase is ALSO log metadata, so pinning is
+    strictly opt-in: it only bypasses when the policy says
+    ``routing.bypass_on_pinned: true``. ``routing.mode: "off"`` always
+    bypasses (that knob means exactly one thing)."""
+    routing_cfg = policy.raw.get("routing", {}) if isinstance(policy.raw, Mapping) else {}
+    if str(routing_cfg.get("mode", "on")) == "off":
+        return True
+    if not routing_cfg.get("bypass_on_pinned", False):
+        return False
+    return bool(requested_model) and requested_model not in _BYPASS_MODEL_NAMES
+
+
 class Router:
     """Routes requests to model tiers using calibrated decisions.
 
@@ -188,7 +206,7 @@ class Router:
         """Blocking convenience wrapper for scripts and sync integrations."""
         return _run_coroutine(self.route_text(text, **kwargs))
 
-    # -- the chain -------------------------------------------------------- #
+    # -- the chain ---------------------------------------------------- #
     async def _route(
         self,
         *,
@@ -200,6 +218,29 @@ class Router:
     ) -> RoutingDecision:
         started = time.perf_counter()
         request_id = request_id or uuid.uuid4().hex
+
+        # 1. Bypass: an explicitly pinned model, or the policy turning routing
+        #    off, passes through untouched -- no gate, no backend, no log
+        #    entry (the point of pinning is that the caller already decided).
+        if _is_bypass(requested_model, self.policy):
+            return RoutingDecision(
+                tier="bypass",
+                model=requested_model or "direct",
+                rule_id="bypass",
+                reason="pinned model; routing bypassed",
+                answers=DecisionAnswers(
+                    complexity=ChoiceAnswer(choice="standard", probabilities={}, confidence=1.0),
+                    sensitivity=ChoiceAnswer(choice="public", probabilities={}, confidence=1.0),
+                    pii=NoulAnswer(value=0.0),
+                    domain=ChoiceAnswer(choice="chat", probabilities={}, confidence=1.0),
+                ),
+                gate=GateVerdict(),
+                backend="bypass",
+                backend_model_version="",
+                effective_sensitivity="public",
+                effective_complexity="standard",
+                latency_ms=round((time.perf_counter() - started) * 1000.0, 3),
+            )
 
         # 2. Local hard gate, on the RAW excerpt. Always. Never bypassed.
         verdict = self.gate.scan(raw_excerpt)
@@ -225,7 +266,29 @@ class Router:
         # Layer 2 forcing local is treated exactly like layer 1 forcing local for
         # the purposes of egress: the same `on_force_local` knob decides whether a
         # request that is staying local anyway still pays for a complexity read.
-        skip_backend = verdict.blocks_backend or (
+        # 2c. Deterministic tier pre-filter (see jev_route.prefilter): rule out
+        #     every tier that could never serve this request BEFORE spending a
+        #     backend call. Gate blocking already implied cloud removal; this
+        #     generalises it (context, capabilities, quota, allow/deny). One
+        #     surviving tier means routing is free: skip the backend and log
+        #     with backend="prefilter" so the distill pipeline still sees it.
+        from .prefilter import filter_tiers
+
+        prefilter_cfg = self.policy.raw.get("prefilter", {}) if isinstance(self.policy.raw, Mapping) else {}
+        pf = filter_tiers(
+            tiers=tuple(self.policy.tiers.keys()),
+            excerpt=raw_excerpt,
+            features=features,
+            verdict=verdict,
+            assessment=assessment,
+            config=prefilter_cfg,
+        )
+        # The gate's own force-local/blocking paths name themselves
+        # (gate.force-local); prefilter only owns the case the gate left alone.
+        prefilter_single = pf.single_candidate and not (
+            verdict.blocks_backend or verdict.force_local or assessment.force_local
+        )
+        skip_backend = verdict.blocks_backend or prefilter_single or (
             (verdict.force_local or assessment.force_local) and self._on_force_local == "skip_backend"
         )
         excerpt_hash = hash_text(raw_excerpt, salt=self.hash_salt)
@@ -240,7 +303,13 @@ class Router:
         #: training log than a tidy-looking one.
         classified = False
 
-        if skip_backend:
+        if prefilter_single:
+            # Free routing: one viable tier. The labels are deterministic, so
+            # the log entry is a high-confidence training target -- and the
+            # model call is never made.
+            backend_result = _gate_only_result(verdict)
+            backend_name = "prefilter"
+        elif skip_backend:
             # Nothing is sent anywhere. The gate itself supplies the labels, which
             # are deterministic and therefore high-confidence training targets.
             backend_result = _gate_only_result(verdict)
@@ -377,6 +446,13 @@ class Router:
         else:
             rule, tier, model = self.policy.evaluate(namespace)
             rule_id, reason = rule.rule_id, rule.reason
+        if backend_name == "prefilter":
+            tier = pf.surviving[0]
+            model = self.policy.pick_model(tier)
+            rule_id = "prefilter.single_candidate"
+            reason = "single viable tier after deterministic prefilter; backend call skipped"
+            if not pf.surviving or pf.surviving[0] == pf.fallback_tier:
+                reason = "no viable tier after deterministic prefilter; failed closed to local fallback"
 
         total_ms = (time.perf_counter() - started) * 1000.0
         decision = RoutingDecision(
@@ -396,6 +472,35 @@ class Router:
             latency_ms=round(total_ms, 3),
             cached=backend_name.endswith(":cached"),
         )
+
+        # 7b. Uncertainty marking (Jevonian's ledger rule): a shaky route is
+        #     never silently accepted. Below the policy's min_confidence the
+        #     decision is marked `uncertain: true` and diverted to the
+        #     uncertain fallback -- the log doubles as a human-review queue.
+        routing_cfg = self.policy.raw.get("routing", {}) if isinstance(self.policy.raw, Mapping) else {}
+        min_conf = routing_cfg.get("min_confidence")
+        if (
+            min_conf is not None
+            and classified
+            and not backend_result.degraded
+            and not decision.uncertain
+            and backend_result.answers.complexity.confidence < float(min_conf)
+        ):
+            uncertain_model = str(routing_cfg.get("uncertain_fallback", decision.model))
+            if routing_cfg.get("uncertain_fallback"):
+                model = uncertain_model
+                tier = "uncertain"
+            escalations.append(
+                f"confidence {backend_result.answers.complexity.confidence:.2f} "
+                f"< min_confidence {float(min_conf):.2f}: marked uncertain"
+            )
+            decision = replace(
+                decision,
+                tier=tier,
+                model=model,
+                escalated=tuple(escalations),
+                uncertain=True,
+            )
 
         # 8. Log. This is the training dataset being written.
         self._log(
