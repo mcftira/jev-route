@@ -91,6 +91,72 @@ python -m jev_route.cli backtest --trace traces/demo_500.jsonl
 python evals/injection/run.py
 ```
 
+## v0.3: the router plugs its own holes
+
+v0.3 closes the leaks the v0.2 eval published — the 25 encoding-trick leaks in
+the table above — and ships the distillation track's first working pieces.
+
+**The encoding class is closed deterministically.** `src/jev_route/gate_normalize.py`
+makes the hard gate scan the text AND decoded variants of it: base64 blobs
+(long runs, or short runs with the `=` padding), spaced-out digit runs, and
+leetspeak inside mostly-digit tokens. `src/jev_route/gate.py` rescans every
+variant, and a variant only matters if its decoded content trips a real
+detector, so random tokens cost nothing. The injection eval is now
+**0 leaks on all 264 cases, 0 false positives**
+([evals/injection/RESULTS.md](evals/injection/RESULTS.md)) — deterministically,
+no model call in the path. The encoding class was a normalization problem, not
+a model problem; [evals/injection/RESULTS_v0.3.md](evals/injection/RESULTS_v0.3.md)
+tells that story.
+
+**Outcome verification (Phase 1).** `src/jev_route/outcome.py` appends
+`jev_route.outcome` records to the same decision log, linked by `request_id`:
+one question per served response — `task_completed` probability, on a capped
+excerpt — and a broken verifier logs `outcome: null` rather than
+retry-storming. The backtest report now shows per-tier completion rates next
+to the cost (`src/jev_route/backtest.py`). Default-off via
+`outcome_verification.enabled`; content the gate blocked or diverted is never
+verified — it goes nowhere.
+
+**The v0.3 steals:**
+
+* **Anti-downgrade.** `routing.uncertain_fallback` is an explicit
+  `hold_middle` (the default — keep the tier the policy chose, mark only the
+  uncertainty) / `cheapest_local` / `frontier` choice
+  (`src/jev_route/router.py`).
+* **Quota tandem.** A tier can name a second deployment —
+  `tiers: {<tier>: {models: […], tandem: <model>}}`
+  (`src/jev_route/policy.py`) — and a 429 or "quota" degrade marks the tier
+  quota-exhausted for the process and flips traffic to the tandem, logged as
+  an escalation (`src/jev_route/router.py`).
+* **IntentCache.** `src/jev_route/intent_cache.py` checks in front of the
+  router and replays the whole decision for exact (after normalization) or
+  near-duplicate (Jaccard ≥ 0.9) text. Requests the gate fired on are never
+  cached and never served from the cache.
+* **LiteLLM custom-classifier adapter.**
+  `src/jev_route/integrations/litellm_classifier.py` runs the router inside
+  LiteLLM's native complexity router (`classifier_type: custom`) — mode 1 in
+  the integration table below.
+
+**The distillation track's first shadow layer.**
+`src/jev_route/backends/laya_scorer.py` (`LayaScorer`) is the neural variant
+of the semantic scorer: a trained multilingual sensitivity head, checkpoint
+parked (gitignored) at `artifacts/laya-sensitivity-head/`. Its training-run
+numbers: held-out accuracy 0.96 on the training split, sensitive-vs-benign
+separation 0.99 vs 0.37 offline — measured at training time, reproducible by
+re-running the training script (`evals/injection/gen_train_variants.py` builds
+the new-seed dataset). Those numbers are why it exists at all; they are NOT
+promotion evidence. On the held-out injection eval its calibrated separation
+is not yet promotion-grade — which is exactly why it runs in **shadow** until
+the semantic gate's promotion criteria (`src/jev_route/gate_semantic.py`,
+`EnforceCriteria`) are met on live traffic. It can only add refusals —
+never remove the deterministic floor.
+
+Reproduce — keyless:
+
+```bash
+python evals/injection/run.py
+```
+
 ## How is this different
 
 **LiteLLM native JEV classifier.** LiteLLM shipped a native complexity classifier, and platform-side complexity routing is a commodity now. What it does not have: a sensitivity layer, decision logging, distillation — and custom tiers are Enterprise-gated. jev-route is the sensitivity + self-ownership layer. A thin LiteLLM adapter (`integrations/`), shipping in v0.3, lets LiteLLM users run the gate inside their own auto_router config.
