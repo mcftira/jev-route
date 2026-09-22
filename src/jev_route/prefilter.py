@@ -78,6 +78,9 @@ def filter_tiers(
     config = config or {}
     allow = {str(t) for t in config.get("allow_tiers", tiers)}
     deny = {str(t) for t in config.get("deny_tiers", [])}
+    # Usually static operator config, but the router also writes it at runtime:
+    # a provider 429/quota error marks the affected tier here for the rest of
+    # the process (Router._mark_tier_quota_exhausted, the v0.3 quota tandem).
     quota_exhausted = {str(t) for t in config.get("quota_exhausted", [])}
     fallback_tier = str(config.get("fallback_tier", "local"))
     # `features` is a RequestFeatures dataclass, not a Mapping: capability

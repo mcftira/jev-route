@@ -76,6 +76,32 @@ _GATE_OVERRIDES_FAIL_OPEN = ("confidential", "regulated")
 
 _BYPASS_MODEL_NAMES = frozenset({"jev-route/auto", "auto", ""})
 
+#: ``routing.uncertain_fallback`` values with router-level meaning (v0.3).
+#: ``hold_middle`` is the default; anything outside this tuple is a literal
+#: model name and keeps the v0.2 behaviour (divert to that exact model, tier
+#: recorded as ``"uncertain"``).
+UNCERTAIN_FALLBACKS: tuple[str, ...] = ("hold_middle", "cheapest_local", "frontier")
+
+#: ``degrade_reason`` substrings that mean "the provider is out of capacity"
+#: rather than "the provider is down". Both spellings are the same condition:
+#: HTTP 429 and "quota exceeded".
+_QUOTA_REASON_MARKERS: tuple[str, ...] = ("429", "quota")
+
+
+def _is_quota_error(reason: str | None) -> bool:
+    """Whether a ``degrade_reason`` is a provider quota error, not an outage.
+
+    A quota error means the tier is DRAINED: its primary model should stop
+    receiving traffic for the rest of the process and its tandem deployment
+    stands in. A timeout or a 5xx means the provider is DOWN, and marking a
+    tier quota-exhausted on a blip would air-gap it for no reason, so only
+    the two quota spellings qualify.
+    """
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _QUOTA_REASON_MARKERS)
+
 
 def _is_bypass(requested_model: str | None, policy: Policy) -> bool:
     """Pinned-model or routing-off pass-through (Jevonian's bypass rule).
@@ -443,6 +469,30 @@ class Router:
                 verdict, backend_result.degrade_reason, semantic=assessment
             )
             model = self.policy.pick_model(tier)
+            if _is_quota_error(backend_result.degrade_reason):
+                # v0.3 quota tandem: the provider ran out of capacity for this
+                # tier; it is not down. Mark the tier quota-exhausted in the
+                # prefilter config for the rest of the process (the router
+                # re-reads policy.raw on every request, and the Policy is
+                # process-lifetime, so the mark lives exactly as long as this
+                # router) and serve THIS request from the tier's tandem
+                # deployment instead of the tier's first model. A timeout or a
+                # 5xx falls through here untouched: the plain degraded path.
+                self._mark_tier_quota_exhausted(tier)
+                tandem_model = self.policy.pick_quota_model(tier)
+                if tandem_model != model:
+                    escalations.append(
+                        f"quota tandem flip: tier {tier} reported a provider quota error "
+                        f"({backend_result.degrade_reason}); {tier} marked quota-exhausted for "
+                        f"the rest of this process, serving tandem {tandem_model} instead of {model}"
+                    )
+                    model = tandem_model
+                else:
+                    escalations.append(
+                        f"quota tandem: tier {tier} reported a provider quota error "
+                        f"({backend_result.degrade_reason}); {tier} marked quota-exhausted for "
+                        f"the rest of this process (no tandem configured for {tier})"
+                    )
         else:
             rule, tier, model = self.policy.evaluate(namespace)
             rule_id, reason = rule.rule_id, rule.reason
@@ -475,8 +525,21 @@ class Router:
 
         # 7b. Uncertainty marking (Jevonian's ledger rule): a shaky route is
         #     never silently accepted. Below the policy's min_confidence the
-        #     decision is marked `uncertain: true` and diverted to the
-        #     uncertain fallback -- the log doubles as a human-review queue.
+        #     decision is marked `uncertain: true`, and where it ends up is
+        #     `routing.uncertain_fallback`, a v0.3 enum:
+        #
+        #     hold_middle   (default) keep the tier the policy chose; mark only
+        #     cheapest_local divert to the local tier's first model
+        #     frontier       divert to the strongest tier's first model
+        #     <model-name>   divert to that exact model (the v0.2 behaviour)
+        #
+        # WHY the default is hold: live decision-log data shows confident-
+        # downgrade is the dominant error class -- the router is confidently
+        # sure of a WEAK tier, not unsure about a strong one. The confidence
+        # bumps above already pushed the answer stricter, so on the remaining
+        # uncertainty the safe move is to keep that choice and flag it for a
+        # human, not to divert to a fallback that is cheaper and weaker by
+        # default. The log doubles as a human-review queue either way.
         routing_cfg = self.policy.raw.get("routing", {}) if isinstance(self.policy.raw, Mapping) else {}
         min_conf = routing_cfg.get("min_confidence")
         if (
@@ -486,13 +549,10 @@ class Router:
             and not decision.uncertain
             and backend_result.answers.complexity.confidence < float(min_conf)
         ):
-            uncertain_model = str(routing_cfg.get("uncertain_fallback", decision.model))
-            if routing_cfg.get("uncertain_fallback"):
-                model = uncertain_model
-                tier = "uncertain"
+            tier, model, note = self._resolve_uncertain_fallback(routing_cfg, decision)
             escalations.append(
                 f"confidence {backend_result.answers.complexity.confidence:.2f} "
-                f"< min_confidence {float(min_conf):.2f}: marked uncertain"
+                f"< min_confidence {float(min_conf):.2f}: marked uncertain ({note})"
             )
             decision = replace(
                 decision,
@@ -554,6 +614,59 @@ class Router:
             tier = self.policy.failure.fail_closed_tier
             note += f"; local gate floor took precedence over fail_open -> tier {tier}"
         return tier, "backend.down", note
+
+    def _resolve_uncertain_fallback(
+        self, routing_cfg: Mapping[str, Any], decision: RoutingDecision
+    ) -> tuple[str, str, str]:
+        """Resolve ``routing.uncertain_fallback`` for a request below min_confidence.
+
+        Returns ``(tier, model, note)``; the note is a short human-readable
+        outcome that goes into the decision's escalations, so the review queue
+        can see what happened to the shaky route.
+        """
+        raw_value = routing_cfg.get("uncertain_fallback")
+        value = str(raw_value).strip() if raw_value is not None else "hold_middle"
+        if value in ("", "hold_middle"):
+            return (
+                decision.tier,
+                decision.model,
+                f"hold_middle: kept the policy's choice ({decision.tier}/{decision.model})",
+            )
+        if value == "cheapest_local":
+            # The tier named "local" is the self-hosted tier by project
+            # convention; a policy without one falls back to the cheapest tier
+            # in tier_order (index 0 is the least capable by definition of the
+            # ordering). First model, deliberately: the divert target must be
+            # deterministic, a review-queue destination, not a round-robin.
+            tier = "local" if "local" in self.policy.tiers else self.policy.tier_order[0]
+            model = self.policy.models_for_tier(tier)[0]
+            return tier, model, f"cheapest_local: diverted to {tier}/{model}"
+        if value == "frontier":
+            tier = self.policy.tier_order[-1]
+            model = self.policy.models_for_tier(tier)[0]
+            return tier, model, f"frontier: diverted to {tier}/{model}"
+        # Anything else is a literal model name: the v0.2 behaviour, unchanged.
+        return "uncertain", value, f"uncertain_fallback: diverted to {value}"
+
+    def _mark_tier_quota_exhausted(self, tier: str) -> None:
+        """Record a tier as quota-exhausted in the prefilter config.
+
+        The mark lives in ``policy.raw["prefilter"]["quota_exhausted"]`` --
+        the same key :func:`~jev_route.prefilter.filter_tiers` reads on every
+        request -- so it persists for the rest of the process (a Policy is
+        built once and owned by the router) and nowhere else. Idempotent: a
+        repeat 429 must not duplicate the entry.
+        """
+        prefilter = self.policy.raw.get("prefilter")
+        if not isinstance(prefilter, dict):
+            prefilter = {}
+            self.policy.raw["prefilter"] = prefilter
+        marked = prefilter.get("quota_exhausted")
+        if not isinstance(marked, list):
+            marked = []
+            prefilter["quota_exhausted"] = marked
+        if tier not in marked:
+            marked.append(tier)
 
     async def _run_shadow(self, request: DecisionRequest, primary: BackendResult) -> dict[str, Any]:
         """Run the shadow backend without letting it affect or delay the decision."""

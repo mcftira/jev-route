@@ -341,6 +341,47 @@ def _parse_blocked_metadata(gate_section: Mapping[str, Any], *, where: str = "ga
         raise PolicyError(str(exc)) from exc
 
 
+def _parse_tiers(tiers_raw: Any) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+    """Parse ``tiers`` into ``(tiers, tandem)``.
+
+    Each tier entry is a single model name, a list of model names, or the v0.3
+    mapping form ``{models: [...], tandem: <model>}``. The ``tandem`` is the
+    second deployment that serves the tier when its primary reports a provider
+    quota error (429 / "quota") -- the same tier, a different account or
+    provider. The bare forms stay the default and carry no tandem.
+    """
+    if not isinstance(tiers_raw, Mapping) or not tiers_raw:
+        raise PolicyError("policy must define at least one tier under `tiers:`")
+    tiers: dict[str, tuple[str, ...]] = {}
+    tandem: dict[str, str] = {}
+    for name, models in tiers_raw.items():
+        name = str(name).strip()
+        if not name:
+            raise PolicyError("tier names must be non-empty")
+        if isinstance(models, Mapping):
+            if models.get("models") is None:
+                raise PolicyError(f"tier {name!r} uses the mapping form but has no `models:` key")
+            tandem_name = models.get("tandem")
+            if tandem_name is not None:
+                if not isinstance(tandem_name, str) or not tandem_name.strip():
+                    raise PolicyError(f"tier {name!r}: `tandem` must be a non-empty model-name string")
+                tandem[name] = tandem_name.strip()
+            models = models.get("models")
+        if isinstance(models, str):
+            resolved: tuple[str, ...] = (models.strip(),)
+        elif isinstance(models, Sequence):
+            resolved = tuple(str(m).strip() for m in models if str(m).strip())
+        else:
+            raise PolicyError(
+                f"tier {name!r} must map to a model name, a list of model names, "
+                "or a mapping with a `models:` key"
+            )
+        if not resolved:
+            raise PolicyError(f"tier {name!r} lists no models")
+        tiers[name] = resolved
+    return tiers, tandem
+
+
 def _parse_failure(raw: Any) -> dict[str, Any]:
     """Normalize ``on_backend_down``, which accepts a mapping or a bare mode string.
 
@@ -367,6 +408,10 @@ class Policy:
     tier_order: tuple[str, ...]
     uncertainty: UncertaintyPolicy
     failure: FailurePolicy
+    #: v0.3 quota tandem: tier -> the second deployment that serves the tier
+    #: when its primary reports a provider quota error (429 / "quota"). Empty
+    #: for tiers written in the bare model-list form.
+    tandem: Mapping[str, str] = field(default_factory=dict)
     pii_threshold: float = 0.5
     backend: Mapping[str, Any] = field(default_factory=dict)
     gate: Mapping[str, Any] = field(default_factory=dict)
@@ -397,23 +442,7 @@ class Policy:
         if version != POLICY_VERSION:
             raise PolicyError(f"unsupported policy version {version}; this build understands version {POLICY_VERSION}")
 
-        tiers_raw = raw.get("tiers") or {}
-        if not isinstance(tiers_raw, Mapping) or not tiers_raw:
-            raise PolicyError("policy must define at least one tier under `tiers:`")
-        tiers: dict[str, tuple[str, ...]] = {}
-        for name, models in tiers_raw.items():
-            name = str(name).strip()
-            if not name:
-                raise PolicyError("tier names must be non-empty")
-            if isinstance(models, str):
-                resolved: tuple[str, ...] = (models.strip(),)
-            elif isinstance(models, Sequence):
-                resolved = tuple(str(m).strip() for m in models if str(m).strip())
-            else:
-                raise PolicyError(f"tier {name!r} must map to a model name or a list of model names")
-            if not resolved:
-                raise PolicyError(f"tier {name!r} lists no models")
-            tiers[name] = resolved
+        tiers, tandem = _parse_tiers(raw.get("tiers") or {})
 
         tier_order_raw = raw.get("tier_order") or []
         tier_order = tuple(str(t).strip() for t in tier_order_raw) or tuple(TIERS)
@@ -459,6 +488,7 @@ class Policy:
             tier_order=tier_order,
             uncertainty=uncertainty,
             failure=failure,
+            tandem=tandem,
             pii_threshold=float(raw.get("pii_threshold", 0.5)),
             backend=dict(raw.get("backend") or {}),
             gate=dict(gate_raw),
@@ -530,6 +560,17 @@ class Policy:
             index = self._cursor_state.get(tier, 0)
             self._cursor_state[tier] = (index + 1) % len(models)
         return models[index]
+
+    def pick_quota_model(self, tier: str) -> str:
+        """Model to serve ``tier`` after its provider reported a quota error.
+
+        The tier's ``tandem`` deployment stands in for the tier's first model:
+        the tier label is unchanged (the routing decision is not the thing that
+        broke) while the drained provider stops receiving traffic. A tier
+        without a tandem configured keeps the ordinary pick, which is exactly
+        the pre-v0.3 degraded path.
+        """
+        return self.tandem.get(tier) or self.pick_model(tier)
 
     def bump_tier(self, tier: str, steps: int = 1) -> str:
         """Move ``steps`` positions up :attr:`tier_order`, clamped.
