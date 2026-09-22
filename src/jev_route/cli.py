@@ -470,6 +470,19 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         p.add_argument("-v", "--verbose", action="store_true")
 
+    p = sub.add_parser("optimize-questions", help="GEPA-compile routing question wording (manual, keyed; never in CI)")
+    p.add_argument("--trace", default="traces/demo_500.jsonl")
+    p.add_argument("--policy", default="policies/default.yaml")
+    p.add_argument("--out", default="policy/compiled_questions.yaml")
+    p.add_argument("--max-metric-calls", type=int, default=150)
+    p.add_argument("--seed", type=int, default=20260922)
+    p.add_argument("--reflection-model", default="openai/w/models/Qwen3.8-27B-Q8_0.gguf",
+                   help="litellm model string for GEPA reflection")
+    p.add_argument("--reflection-base", default="http://192.168.1.124:8010/v1",
+                   help="OpenAI-compatible endpoint for the reflection model")
+    p.add_argument("--dry-run", action="store_true", help="validate seed/dataset/evaluator without spending calls")
+    p.set_defaults(func=_cmd_optimize_questions)
+
     p = sub.add_parser("backtest", help="replay a request trace through a policy and measure cost delta")
     p.add_argument("--trace", required=True, help="JSONL trace (e.g. traces/demo_500.jsonl)")
     p.add_argument("--policy", default="policies/default.yaml")
@@ -607,6 +620,84 @@ def _version() -> str:
         return __version__
     except Exception:
         return "unknown"
+
+
+def _cmd_optimize_questions(args: Any) -> int:
+    import os
+
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("error: TYPESAFE_API_KEY is not set. Export it first "
+              "(the key lives in the untracked .env; source it or export it manually).", file=sys.stderr)
+        return 2
+    from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
+    from optimize.questions import QuestionEvaluator, load_stratified, provenance_header, seed_candidate, write_compiled
+
+    from .policy import Policy
+
+    policy = Policy.from_file(args.policy)
+    train, val = load_stratified(args.trace, n_train=80, n_val=60, seed=args.seed)
+    evaluator = QuestionEvaluator(policy=policy)
+    seed = seed_candidate()
+    if args.dry_run:
+        probe = evaluator.evaluate(seed, train[:4])
+        print(f"dry-run ok: train={len(train)} val={len(val)}; seed probe score {probe['score']:.3f} "
+              f"(accuracy {probe['accuracy']:.2f}, savings {probe['savings']:.2f})")
+        return 0
+
+    print(f"compiling: train={len(train)} val={len(val)} budget={args.max_metric_calls} metric calls")
+    def _per_example(candidate: dict, example: dict | None = None, **_kw: object):
+        """GEPA's per-example contract: one trace row in, (score, outputs) out;
+        oa.log carries the misroute feedback that becomes the gradient."""
+        import gepa.optimize_anything as oa
+
+        assert example is not None
+        outcome = evaluator.evaluate_one(candidate, example)
+        if outcome["miss"]:
+            oa.log(
+                f"{example['id']}: policy intends {outcome['expected']}, candidate questions "
+                f"produced {outcome['got']} (rule {outcome['rule_id']})"
+            )
+        return outcome["score"], {"id": example["id"], "expected": outcome["expected"], "got": outcome["got"]}
+
+    result = optimize_anything(
+        seed_candidate=seed,
+        evaluator=_per_example,
+        dataset=[{"id": r["id"], "input": r["text"], "expected": r["category"]} for r in train],
+        valset=[{"id": r["id"], "input": r["text"], "expected": r["category"]} for r in val],
+        objective=(
+            "Optimize routing question wording to maximize tier accuracy on the synthetic trace, "
+            "with cost as the tiebreaker. Misroute feedback lists expected-vs-produced tiers."
+        ),
+        background=(
+            "The artifact is routing question TEXT for an LLM router. Expected tiers come from a "
+            "synthetic trace with category labels (trivial_completion->local, code_gen->cheap, "
+            "multi_file_refactor->strong, hungarian_support->cheap, pii_fake->local, "
+            "long_context->strong)."
+        ),
+        config=GEPAConfig(
+            engine=EngineConfig(seed=args.seed, max_metric_calls=args.max_metric_calls),
+            reflection=ReflectionConfig(
+                reflection_lm=args.reflection_model,
+                reflection_lm_kwargs={"api_base": args.reflection_base, "api_key": "sk-local"},
+                reflection_minibatch_size=12,
+            ),
+        ),
+    )
+    best = getattr(result, "best_candidate", None) or seed
+    blob = best.get("questions_yaml", seed["questions_yaml"]) if isinstance(best, dict) else seed["questions_yaml"]
+    baseline = evaluator.evaluate(seed, val)
+    compiled = evaluator.evaluate(best, val)
+    write_compiled(
+        args.out,
+        blob,
+        provenance_header(
+            baseline_score=baseline["score"], compiled_score=compiled["score"],
+            seed=args.seed, max_metric_calls=args.max_metric_calls,
+        ),
+    )
+    print(f"baseline {baseline['score']:.4f} -> compiled {compiled['score']:.4f} (valset n={len(val)})")
+    print(f"wrote {args.out}")
+    return 0
 
 
 def _cmd_backtest(args: Any) -> int:

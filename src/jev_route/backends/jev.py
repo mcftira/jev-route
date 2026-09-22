@@ -58,6 +58,31 @@ _TRUST_BOUNDARY = (
 #: The decision schema. One call, four independent questions, run in parallel
 #: server-side. Changing these changes what gets logged and therefore what can be
 #: distilled, so treat them as part of the dataset contract.
+def _merge_question_overrides(
+    questions: dict[str, Any], overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply wording overrides without ever changing the schema: question
+    types, criteria keys and structure come from the defaults; only
+    instruction/criteria TEXT may be replaced by the override. Anything the
+    override cannot describe is dropped from the override (and logged by
+    shape, not content) so a malformed candidate cannot silently rewrite a
+    question."""
+    import copy
+
+    merged = copy.deepcopy(questions)
+    for qid, spec in (overrides or {}).items():
+        if qid not in merged or not isinstance(spec, dict):
+            continue
+        if "instructions" in spec and isinstance(spec["instructions"], str):
+            merged[qid]["instructions"] = spec["instructions"]
+        crit = spec.get("criteria")
+        if isinstance(crit, dict):
+            for key, text in crit.items():
+                if key in merged[qid].get("criteria", {}) and isinstance(text, str):
+                    merged[qid]["criteria"][key] = text
+    return merged
+
+
 def build_questions(*, include_domain: bool = True) -> dict[str, Any]:
     """Construct the ``questions`` map for one routing decision."""
     questions: dict[str, Any] = {
@@ -264,8 +289,13 @@ class JevBackend:
         include_domain: bool = True,
         breaker: CircuitBreaker | None = None,
         client: Any = None,
+        question_overrides: dict[str, Any] | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")
+        # v0.4 compile-time seam: question wording may be overridden (GEPA
+        # candidate evaluation). None means the hand-written defaults, byte
+        # for byte.
+        self.question_overrides = question_overrides
         self.api_url = api_url
         self.model = model
         self.timeout_seconds = timeout_seconds
@@ -311,6 +341,10 @@ class JevBackend:
     async def decide(self, request: DecisionRequest) -> BackendResult:
         """Ask Jev the routing questions. Never raises on outage; degrades instead."""
         questions = build_questions(include_domain=self.include_domain)
+        if self.question_overrides:
+            # v0.4: GEPA candidate evaluation merges the candidate's wording
+            # over the hand-written defaults; the schema never changes.
+            questions = _merge_question_overrides(questions, self.question_overrides)
         payload = {
             "state": request.state(),
             "model": self.model,

@@ -425,6 +425,13 @@ class Policy:
     #: request. Enabled by default; it carries no content.
     blocked_metadata: BlockedMetadataPolicy = field(default_factory=BlockedMetadataPolicy)
     version: int = POLICY_VERSION
+    #: v0.4: which question wording the backend uses. ``handwritten`` (default)
+    #: is the hand-written defaults; ``compiled`` loads the GEPA artifact from
+    #: ``compiled_questions_path`` into JevBackend.question_overrides at
+    #: backend construction. Adoption only ever flips to compiled after the
+    #: three-part gate in the work order passes.
+    questions: str = "handwritten"
+    compiled_questions_path: str = "policy/compiled_questions.yaml"
     source: str | None = None
     #: The document this policy was parsed from, kept verbatim so
     #: :meth:`with_overrides` can round-trip back to YAML without losing comments
@@ -442,6 +449,9 @@ class Policy:
         if version != POLICY_VERSION:
             raise PolicyError(f"unsupported policy version {version}; this build understands version {POLICY_VERSION}")
 
+        questions_mode = str(raw.get("questions", "handwritten"))
+        if questions_mode not in ("handwritten", "compiled"):
+            raise PolicyError(f"questions must be 'handwritten' or 'compiled', got {questions_mode!r}")
         tiers, tandem = _parse_tiers(raw.get("tiers") or {})
 
         tier_order_raw = raw.get("tier_order") or []
@@ -489,6 +499,8 @@ class Policy:
             uncertainty=uncertainty,
             failure=failure,
             tandem=tandem,
+            questions=questions_mode,
+            compiled_questions_path=str(raw.get("compiled_questions_path", "policy/compiled_questions.yaml")),
             pii_threshold=float(raw.get("pii_threshold", 0.5)),
             backend=dict(raw.get("backend") or {}),
             gate=dict(gate_raw),
