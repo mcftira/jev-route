@@ -73,6 +73,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..backends.base import DecisionBackend
+from ..intent_cache import IntentCache
 from ..router import Router
 from ..schema import TIERS, RoutingDecision
 from . import _shared
@@ -303,6 +305,236 @@ class JevRouteClassifier:
             LOGGER.warning("jev-route: on_decision callback failed (%s: %s); ignoring.", type(exc).__name__, exc)
 
 
+class JevRouteClassifierAdapter:
+    """Thin custom-classifier adapter: one text in, one flat dict out.
+
+    This is the distribution-facing entry point for jev-route's classifier. It
+    wraps the existing :class:`~jev_route.router.Router` and answers
+    :meth:`classify` with exactly four keys and nothing else::
+
+        {"tier": "strong", "model": "qwen3.8-max", "gate_fired": False, "uncertain": False}
+
+    * ``tier`` -- the tier the policy resolved (``local`` / ``cheap`` /
+      ``strong``, or whatever the policy defines), or ``None`` when no
+      decision was produced (timeout or internal error). Treat ``None`` as
+      "no answer".
+    * ``model`` -- the concrete model name the policy picked for that tier, or
+      ``None`` alongside a declined decision.
+    * ``gate_fired`` -- true when the local hard gate matched something in the
+      text. That decision was forced by local, deterministic rules, not by the
+      backend's judgement.
+    * ``uncertain`` -- true when the decision was diverted to the policy's
+      uncertain fallback (confidence below the floor). The route is a guess,
+      and this key says so.
+
+    **Backend: MockBackend by default, configurable.** With no arguments the
+    adapter resolves the policy through :func:`._shared.load_policy` (the
+    ``JEV_ROUTE_POLICY`` env var, else ``policies/default.yaml``, else the
+    built-in fallback) and routes it on the deterministic offline
+    :class:`~jev_route.backends.mock.MockBackend` -- no API key, no network,
+    works out of the box. Pass ``backend=`` for a different decision backend
+    (``JevBackend``, a distilled one) or ``router=`` for a fully built router
+    (explicit sink, shared process-wide router, ...). An explicit router
+    outranks ``backend=``; the policy's own backend is never started
+    implicitly, because a distribution entry point must not silently require a
+    credential it was not told about.
+
+    **Wire it into LiteLLM's complexity router with ``classifier_type:
+    custom``.** LiteLLM's custom classifier is a
+    ``litellm.types.router.ClassifierPlugin`` -- an *instance* whose
+    ``async def classify(self, context) -> str | None`` returns a *tier name*.
+    This adapter is deliberately plain and synchronous (a dict, not a tier),
+    so the bridge is a five-line plugin::
+
+        # my_app/jev_classifier.py
+        from litellm.types.router import ClassifierPlugin
+        from jev_route.integrations.litellm_classifier import JevRouteClassifierAdapter
+
+        class JevRoutePlugin(ClassifierPlugin):
+            def __init__(self) -> None:
+                self._adapter = JevRouteClassifierAdapter()  # MockBackend by default
+
+            async def classify(self, context):
+                messages = list(getattr(context, "raw_messages", None) or [])
+                text = str(messages[-1].get("content", "")) if messages else ""
+                return self._adapter.classify(text)["tier"]  # None -> fallback_tier decides
+
+        classifier = JevRoutePlugin()
+
+        # config.yaml
+        #   model_list:
+        #     - model_name: auto
+        #       litellm_params:
+        #         model: auto_router/complexity_router
+        #         complexity_router_config:
+        #           classifier_type: custom
+        #           classifier_plugin: my_app.jev_classifier.classifier
+        #           fallback_tier: local
+        #           tier_definitions:
+        #             - {name: local,  description: "sensitive or gate-matched; stays on self-hosted models"}
+        #             - {name: cheap,  description: "routine work with no sensitivity signal"}
+        #             - {name: strong, description: "hard multi-step reasoning"}
+        #           tiers:
+        #             local: [qwen38]
+        #             cheap: [qwen3.8-flash]
+        #             strong: [qwen3.8-max]
+
+    Returning ``None`` from the bridge is the decline: it hands control to
+    ``fallback_tier``, the operator's choice, instead of guessing. If you want
+    the ready-made plugin instead of the bridge -- tier names only, no dict --
+    use :class:`JevRouteClassifier` in this same module.
+
+    **Intent cache (opt-in).** Pass ``intent_cache=`` an
+    :class:`~jev_route.intent_cache.IntentCache` (build one from the policy
+    with :func:`~jev_route.intent_cache.build_intent_cache`) and
+    :meth:`classify` checks it before routing: a near-duplicate of an earlier
+    request is answered without touching the gate, backend or log. Decisions
+    the gate fired on are never stored. Without it, this class is exactly one
+    router call plus a projection.
+
+    Args:
+        router: an explicit :class:`~jev_route.router.Router` or a zero-arg
+            factory. Outranks ``backend=`` and ``policy_path=``.
+        backend: the decision backend to use when ``router=`` is not given.
+            ``None`` (default) means MockBackend.
+        policy_path: the policy file; ``None`` uses the normal discovery
+            chain (env var, working directory, built-in fallback).
+        timeout_ms: per-decision budget. ``None`` means
+            :func:`._shared.timeout_ms` (``JEV_ROUTE_TIMEOUT_MS``, default
+            3000). The budget exists because this method is synchronous and
+            its callers -- a LiteLLM classifier, a script -- have no budget of
+            their own; without it a hung backend hangs the request.
+        intent_cache: optional near-duplicate cache checked before routing.
+    """
+
+    def __init__(
+        self,
+        router: Router | RouterFactory | None = None,
+        *,
+        backend: DecisionBackend | None = None,
+        policy_path: str | Path | None = None,
+        timeout_ms: float | None = None,
+        intent_cache: IntentCache | None = None,
+    ) -> None:
+        self._router = router
+        self._backend = backend
+        self._policy_path = policy_path
+        self._timeout_ms = timeout_ms
+        self._intent_cache = intent_cache
+
+    @property
+    def router(self) -> Router:
+        """The router, resolved on first use so constructing the adapter is side-effect free."""
+        if self._router is None:
+            self._router = self._build_router()
+        elif isinstance(self._router, Callable) and not isinstance(self._router, Router):
+            self._router = self._router()
+        return self._router
+
+    @property
+    def intent_cache(self) -> IntentCache | None:
+        """The near-duplicate cache, or ``None`` when this adapter routes every request."""
+        return self._intent_cache
+
+    def _build_router(self) -> Router:
+        policy = _shared.load_policy(self._policy_path, strict=False)
+        if self._backend is not None:
+            return Router(policy, self._backend)
+        # The default is the deterministic offline backend, whatever the policy
+        # file says: a distribution entry point must work with no key and no
+        # network, and a policy that asks for the cloud can be answered with a
+        # coarse-but-safe read rather than a credential requirement the caller
+        # was not told about.
+        return Router(policy, _shared._mock_backend())
+
+    # -- the interface ------------------------------------------------------ #
+    def classify(self, text: str) -> dict[str, Any]:
+        """Route one text and project the decision to the four-key dict.
+
+        Never raises: a decision that cannot be produced (budget exhausted,
+        internal error) comes back as
+        ``{"tier": None, "model": None, "gate_fired": False, "uncertain":
+        True}`` -- a decline in dict form, the same semantics the plugin
+        expresses with ``None``.
+        """
+        text = str(text or "")
+        cache = self._intent_cache
+        if cache is not None:
+            # Checked BEFORE routing. The gate_fired flag is not passed here on
+            # purpose: at this point the gate has not run yet, and a hit can
+            # only be an entry that was stored with gate_fired=False. The gate
+            # is deterministic on the text, so a text that was clean when
+            # stored is clean now -- the cached decision's own gate verdict is
+            # exactly what a fresh pass would produce.
+            hit = cache.lookup(text)
+            if hit is not None:
+                return _decision_dict(hit.decision)
+        decision, _reason = _run(
+            _shared.decide_with_reason(
+                self.router,
+                prompt=text,
+                timeout_ms=self._timeout_ms if self._timeout_ms is not None else _shared.timeout_ms(),
+            )
+        )
+        if decision is None:
+            return _declined()
+        if cache is not None:
+            # The gate contract, enforced at the only point this adapter knows
+            # the gate's verdict: after the router ran. Gate-fired decisions are
+            # never cached, so credential-bearing text leaves no durable trace
+            # here either.
+            cache.store(text, decision, gate_fired=_gate_fired(decision.gate))
+        return _decision_dict(decision)
+
+
+def _decision_dict(decision: RoutingDecision) -> dict[str, Any]:
+    """The four-key projection. Empty tier/model (a rule pinned a model with no
+    tier) becomes ``None``: in this contract, "no tier" and "no decision" are
+    both declines."""
+    return {
+        "tier": decision.tier or None,
+        "model": decision.model or None,
+        "gate_fired": _gate_fired(decision.gate),
+        "uncertain": bool(decision.uncertain),
+    }
+
+
+def _declined() -> dict[str, Any]:
+    """The no-decision shape. A fresh dict per call: callers may mutate it."""
+    return {"tier": None, "model": None, "gate_fired": False, "uncertain": True}
+
+
+def _gate_fired(verdict: Any) -> bool:
+    """Whether the local gate matched anything in the text.
+
+    ``fired`` already implies ``force_local``/``blocks_backend`` today (both are
+    set only from findings), but the three are named so the contract reads as
+    "any hard gate signal", and stays right if the schema ever lets them diverge.
+    """
+    fired = getattr(verdict, "fired", False)
+    force_local = getattr(verdict, "force_local", False)
+    blocks_backend = getattr(verdict, "blocks_backend", False)
+    return bool(fired or force_local or blocks_backend)
+
+
+def _run(coro: Any) -> Any:
+    """Run a coroutine from sync code, whether or not an event loop is running.
+
+    The classifier bridge is ``async def``, but this adapter is deliberately
+    usable from plain scripts and tests too; inside a running loop we cannot
+    block on it, so the decision runs in a worker thread with its own loop.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def _schedule(awaitable: Awaitable[Any]) -> None:
     """Best-effort fire-and-forget, with the task referenced so it cannot be GC'd."""
     import asyncio  # deferred import: only needed on the callback path
@@ -370,5 +602,6 @@ __all__ = [
     "TIERS_ENV_VAR",
     "DecisionCallback",
     "JevRouteClassifier",
+    "JevRouteClassifierAdapter",
     "classifier",
 ]
