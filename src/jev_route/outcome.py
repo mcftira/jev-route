@@ -126,8 +126,9 @@ class OutcomeVerifier:
             checked_at=time.time(),
             sampled=True,
         )
-        try:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            # logging must never take serving down either
             self.sink.write(record)
-        except Exception:
-            pass  # logging must never take serving down either
         return record

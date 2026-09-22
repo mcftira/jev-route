@@ -278,7 +278,7 @@ class JevRoutePreCallHook(CustomLogger):
     async def async_log_success_event(
         self,
         kwargs: dict,
-        response_obj: Any,  # noqa: ARG002 -- signature fixed by LiteLLM's CustomLogger
+        response_obj: Any,
         start_time: Any,  # noqa: ARG002 -- protocol, not ours to trim
         end_time: Any,  # noqa: ARG002
     ) -> None:
@@ -319,7 +319,7 @@ class JevRoutePreCallHook(CustomLogger):
         except Exception as exc:  # broad except, deliberately: observation must never break a response
             LOGGER.debug("jev-route: async_log_success_event failed (%s); ignoring.", exc)
 
-    async def _verify_outcome(self, kwargs: dict, response_obj: Any, summary: dict) -> None:
+    async def _verify_outcome(self, kwargs: dict, response_obj: Any, summary: dict) -> None:  # noqa: ARG002 -- LiteLLM callback signature
         """Outcome verification (v0.3): one noul on the configured backend,
         appended as a `jev_route.outcome` record linked by request_id.
 

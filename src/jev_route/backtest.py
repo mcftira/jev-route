@@ -65,7 +65,7 @@ class TraceBackend:
             latency_ms=1.0,
         )
 
-    def noul(self, state: Any, instructions: str) -> float:
+    def noul(self, state: Any, instructions: str) -> float:  # noqa: ARG002 -- protocol signature is fixed
         """Outcome seam for the backtest: synthetic completion scores, slightly
         tier-dependent so the report's per-model rates differ (illustrative)."""
         return {"local": 0.85, "cheap": 0.92, "strong": 0.97}.get(str(self._row["expected_tier"]), 0.9)
