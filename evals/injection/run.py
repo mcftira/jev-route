@@ -65,8 +65,9 @@ def render(results: dict, *, cases_path: Path) -> str:
         "",
         f"* categories 1-2 (injection wrappers, authority framing): **{len(cat12_leaks)} leaks** --"
         f" {'PASS' if not cat12_leaks else 'FAIL'} (bar: 0).",
-        f"* category 3 (encoding tricks): **{len(cat3_leaks)} leaks** -- documented below, not a",
-        "  blocker: this is the published argument for the distilled semantic layer.",
+        f"* category 3 (encoding tricks): **{len(cat3_leaks)} leaks** -- since v0.3 the gate",
+        "  normalizes encodings (base64/spaced/leet) and rescans deterministically, so this",
+        "  class is closed without a model; see RESULTS_v0.3.md.",
         f"* category 4 (benign controls): **{len(fps)} false positives** -- these are the",
         "  provably-fake cases the gate must NOT block.",
         "",

@@ -585,14 +585,32 @@ class HardGate:
         blocks = False
         pii_floor: float | None = None
 
+        # Encoding normalization (v0.3): scan the original text AND decoded
+        # variants of it (base64 blobs, spaced-out digits, leet-in-digit-runs).
+        # Regexes cannot see through encodings, but the encodings are a
+        # normalization problem, not a model problem.
+        from .gate_normalize import normalization_variants
+
+        texts = [text, *normalization_variants(text)]
+        scan_text = " ".join(texts) if len(texts) > 1 else text
+
         for detector in self.detectors:
-            matches = list(detector.pattern.finditer(text))
+            matches = list(detector.pattern.finditer(scan_text))
             if not matches:
                 continue
             accepted = [m for m in matches if detector.validator(m.group(0))]
             if not accepted:
                 continue
-            hits.append((detector, accepted))
+            # Normalization variants can reproduce the same finding (a spaced
+            # card and its collapsed form): one content, one finding.
+            seen: set[str] = set()
+            deduped = []
+            for m in accepted:
+                if m.group(0) in seen:
+                    continue
+                seen.add(m.group(0))
+                deduped.append(m)
+            hits.append((detector, deduped))
 
         hits = self._suppress_contained(hits)
 
