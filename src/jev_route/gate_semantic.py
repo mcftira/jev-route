@@ -58,7 +58,11 @@ vocabulary -- small enough to evaluate in pure Python, and readable with
 ``json.load`` so a security reviewer can see every token the model keys on
 without running anything. Heavier students can be substituted by implementing
 :class:`SemanticScorer`; the artifact format, the promotion criteria and the
-router integration do not change.
+router integration do not change. The v0.3 Laya sensitivity head is exactly
+such a substitute: its artifact payload carries ``scorer.kind: "laya"`` plus
+the checkpoint directory (see :mod:`jev_route.backends.laya_scorer`), and the
+loader builds the matching scorer -- the layer above it does not know, or
+care, which one answered.
 """
 
 from __future__ import annotations
@@ -78,9 +82,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from .schema import SENSITIVITY_LEVELS, GateVerdict, RequestFeatures, level_index
 
 if TYPE_CHECKING:
-    # Import-for-typing only. Both modules are stdlib-light, but the gate must not
-    # depend on the policy engine at runtime and the policy engine already depends
-    # on this module, so the edge is drawn here and nowhere else.
+    # Import-for-typing only. The two policy/gate modules are stdlib-light, but
+    # the gate must not depend on the policy engine at runtime and the policy
+    # engine already depends on this module, so the edge is drawn here and
+    # nowhere else. ``LayaScorer`` joins the union for the same reason: its
+    # module is stdlib-only at import time, but it lives under ``backends``,
+    # whose package init already imports the policy engine -- a module-level
+    # edge from the gate there would be a cycle.
+    from .backends.laya_scorer import LayaScorer
     from .gate import HardGate
     from .policy import Policy
 
@@ -97,6 +106,13 @@ SEMANTIC_MODES: tuple[str, ...] = ("off", "shadow", "enforce")
 DEFAULT_SEMANTIC_MODE = "shadow"
 DEFAULT_SEMANTIC_THRESHOLD = 0.5
 DEFAULT_SEMANTIC_LEVEL = "confidential"
+
+#: Scorer kinds the artifact format can carry (``scorer.kind``). ``"lexicon"`` is
+#: the default and may be omitted from the payload; ``"laya"`` carries a
+#: fine-tuned Laya head as a local checkpoint directory
+#: (``scorer.checkpoint_dir``). An unknown kind is refused at load time: a kind
+#: this build cannot read must fail the deploy, not degrade to the wrong model.
+SCORER_KINDS: tuple[str, ...] = ("lexicon", "laya")
 
 #: The lowest sensitivity level layer 2 is allowed to assert. ``public`` and
 #: ``internal`` are excluded because a semantic finding is only ever a claim that
@@ -585,11 +601,76 @@ class Provenance:
         )
 
 
+def _scorer_from_payload(
+    scorer_cfg: Mapping[str, Any], *, model_version: str, where: str
+) -> LexiconScorer | LayaScorer:
+    """Build the scorer the artifact's ``scorer`` payload describes, validating it.
+
+    This is where the ``kind`` discriminator is read. ``"lexicon"`` is the
+    default and may be omitted: it builds the vocabulary scorer from the inline
+    weights. ``"laya"`` builds the neural scorer from the checkpoint directory
+    pointer -- the weights live in the checkpoint, the artifact carries the
+    address and the exact question. Every failure is a
+    :class:`SemanticArtifactError` with the reason: the artifact is the only
+    source of truth for which model is running.
+    """
+    kind = str(scorer_cfg.get("kind", "lexicon")).strip().lower()
+    if kind not in SCORER_KINDS:
+        raise SemanticArtifactError(
+            f"{where}: scorer.kind={kind!r} is not supported by this build (supports "
+            f"{list(SCORER_KINDS)}). An unknown kind must fail the load, not degrade to the "
+            "wrong model."
+        )
+    if kind == "laya":
+        from .backends.laya_scorer import LayaScorer  # lazy: torch/laya stay out of the gate import
+
+        checkpoint_dir = scorer_cfg.get("checkpoint_dir")
+        if not isinstance(checkpoint_dir, (str, Path)) or not str(checkpoint_dir).strip():
+            raise SemanticArtifactError(
+                f"{where}: scorer.checkpoint_dir is required for scorer.kind='laya' "
+                "(the trained Laya head's checkpoint directory)."
+            )
+        question = scorer_cfg.get("question")
+        if question is not None and not isinstance(question, Mapping):
+            raise SemanticArtifactError(f"{where}: scorer.question must be an object when present")
+        return LayaScorer(
+            str(checkpoint_dir),
+            model_version=model_version,
+            device=str(scorer_cfg.get("device", "auto")),
+            question=dict(question) if question is not None else None,
+        )
+    if str(scorer_cfg.get("name", "")) != LexiconScorer.name:
+        raise SemanticArtifactError(
+            f"{where}: scorer.name={scorer_cfg.get('name')!r} is not supported by this build "
+            f"(expects {LexiconScorer.name!r})."
+        )
+    tokenizer = scorer_cfg.get("tokenizer") or {}
+    if not isinstance(tokenizer, Mapping):
+        raise SemanticArtifactError(f"{where}: scorer.tokenizer must be an object")
+    weights = scorer_cfg.get("weights")
+    if not isinstance(weights, Mapping):
+        raise SemanticArtifactError(f"{where}: scorer.weights must be an object of token -> weight")
+    scorer = LexiconScorer(
+        weights,
+        bias=float(scorer_cfg.get("bias", 0.0)),
+        model_version=model_version,
+        lower=bool(tokenizer.get("lower", True)),
+        min_token_chars=int(tokenizer.get("min_token_chars", 2)),
+        ngram_max=int(tokenizer.get("ngram_max", 2)),
+    )
+    for value in scorer.weights.values():
+        if not math.isfinite(value):
+            raise SemanticArtifactError(f"{where}: scorer.weights contains a non-finite value")
+    if not math.isfinite(scorer.bias):
+        raise SemanticArtifactError(f"{where}: scorer.bias is not finite")
+    return scorer
+
+
 @dataclass(frozen=True)
 class SemanticArtifact:
     """A loaded semantic-layer artifact: scorer, threshold, metrics, provenance."""
 
-    scorer: LexiconScorer
+    scorer: LexiconScorer | LayaScorer
     metadata: dict[str, Any]
     metrics: dict[str, Any]
     provenance: Provenance
@@ -630,16 +711,29 @@ class SemanticArtifact:
         payload.setdefault("threshold", self.threshold)
         payload.setdefault("level", self.level)
         payload.setdefault("provenance", self.provenance.to_dict())
-        payload["scorer"] = {
-            "name": self.scorer.name,
-            "bias": self.scorer.bias,
-            "tokenizer": {
-                "lower": self.scorer.lower,
-                "min_token_chars": self.scorer.min_token_chars,
-                "ngram_max": self.scorer.ngram_max,
-            },
-            "weights": dict(sorted(self.scorer.weights.items())),
-        }
+        if getattr(self.scorer, "kind", "lexicon") == "laya":
+            # The Laya head cannot be inlined: its weights are a checkpoint
+            # directory, not a JSON table. The artifact carries the pointer and
+            # the exact question, and the checkpoint must live next to whatever
+            # deployment loads the artifact (layer 2 is local by contract).
+            payload["scorer"] = {
+                "kind": "laya",
+                "name": self.scorer.name,
+                "checkpoint_dir": self.scorer.checkpoint_dir,
+                "device": self.scorer.device,
+                "question": dict(self.scorer.question),
+            }
+        else:
+            payload["scorer"] = {
+                "name": self.scorer.name,
+                "bias": self.scorer.bias,
+                "tokenizer": {
+                    "lower": self.scorer.lower,
+                    "min_token_chars": self.scorer.min_token_chars,
+                    "ngram_max": self.scorer.ngram_max,
+                },
+                "weights": dict(sorted(self.scorer.weights.items())),
+            }
         payload["metrics"] = dict(self.metrics)
         return payload
 
@@ -693,24 +787,8 @@ class SemanticArtifact:
         scorer_cfg = raw.get("scorer")
         if not isinstance(scorer_cfg, Mapping):
             raise SemanticArtifactError(f"{where} has no `scorer` object")
-        if str(scorer_cfg.get("name", "")) != LexiconScorer.name:
-            raise SemanticArtifactError(
-                f"{where}: scorer.name={scorer_cfg.get('name')!r} is not supported by this build "
-                f"(expects {LexiconScorer.name!r})."
-            )
-        tokenizer = scorer_cfg.get("tokenizer") or {}
-        if not isinstance(tokenizer, Mapping):
-            raise SemanticArtifactError(f"{where}: scorer.tokenizer must be an object")
-        weights = scorer_cfg.get("weights")
-        if not isinstance(weights, Mapping):
-            raise SemanticArtifactError(f"{where}: scorer.weights must be an object of token -> weight")
-        scorer = LexiconScorer(
-            weights,
-            bias=float(scorer_cfg.get("bias", 0.0)),
-            model_version=str(raw.get("model_version", "semantic-unknown")),
-            lower=bool(tokenizer.get("lower", True)),
-            min_token_chars=int(tokenizer.get("min_token_chars", 2)),
-            ngram_max=int(tokenizer.get("ngram_max", 2)),
+        scorer = _scorer_from_payload(
+            scorer_cfg, model_version=str(raw.get("model_version", "semantic-unknown")), where=where
         )
         provenance = Provenance.from_dict(raw.get("provenance"), where=where)
         provenance.validate(where=where)
@@ -722,11 +800,6 @@ class SemanticArtifact:
                 "numbers, so an artifact without them can never be promoted -- retrain it with a "
                 "held-out split."
             )
-        for value in scorer.weights.values():
-            if not math.isfinite(value):
-                raise SemanticArtifactError(f"{where}: scorer.weights contains a non-finite value")
-        if not math.isfinite(scorer.bias):
-            raise SemanticArtifactError(f"{where}: scorer.bias is not finite")
 
         return cls(
             scorer=scorer,
@@ -1709,6 +1782,7 @@ __all__ = [
     "DISAGREEMENT_KINDS",
     "DISAGREE_SEMANTIC_MISS",
     "DISAGREE_SEMANTIC_ONLY",
+    "SCORER_KINDS",
     "SEMANTIC_ARTIFACT_FILE",
     "SEMANTIC_ARTIFACT_KIND",
     "SEMANTIC_ARTIFACT_VERSION",
