@@ -91,6 +91,12 @@ python -m jev_route.cli backtest --trace traces/demo_500.jsonl
 python evals/injection/run.py
 ```
 
+## How is this different
+
+**LiteLLM native JEV classifier.** LiteLLM shipped a native complexity classifier, and platform-side complexity routing is a commodity now. What it does not have: a sensitivity layer, decision logging, distillation — and custom tiers are Enterprise-gated. jev-route is the sensitivity + self-ownership layer. A thin LiteLLM adapter (`integrations/`), shipping in v0.3, lets LiteLLM users run the gate inside their own auto_router config.
+
+**Vercel AI Gateway ZDR.** Trusting a gateway's zero-retention promise versus running a deterministic local gate that never sends the payload anywhere is the whole difference: one is a policy you can audit, the other is a fact you can verify.
+
 ## Contents
 
 - [v0.2: hardening + measured numbers](#v02-hardening--measured-numbers)

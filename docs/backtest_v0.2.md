@@ -84,3 +84,17 @@ The trace carries 60 provably-fake PII rows; the gate fired on 29 of them. The 3
 > Honest reading: the oracle replay makes the headline a routing-distribution number on a
 > synthetic traffic mix, not a model-quality claim. Swap in a real classifier and the tiers
 > (and the dollars) move; the Gate section above does not, because the gate is deterministic.
+
+## Outcome verification (synthetic)
+
+* verified outcomes: **471/500** routed requests
+* per-tier completion rate (Phase 1 plumbing check -- synthetic scores):
+
+| tier | n | mean completion p |
+|---|---|---|
+| cheap | 351 | 0.88 |
+| strong | 120 | 0.97 |
+
+> On live traffic these numbers come from the real decision backend; here
+> they prove the plumbing (the first 'is the routing actually good' number,
+> distinct from cost).

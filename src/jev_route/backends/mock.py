@@ -130,6 +130,16 @@ class MockBackend:
     def __init__(self, *, temperature: float = TEMPERATURE) -> None:
         self.temperature = temperature
 
+    def noul(self, state: Any, instructions: str) -> float:
+        """The outcome-verification seam (optional protocol method). Mock rule:
+        a non-empty response excerpt completes the task. Deterministic, so CI
+        exercises the verifier without keys."""
+        if isinstance(state, dict):
+            excerpt = str(state.get("response_excerpt", ""))
+        else:
+            excerpt = str(state)
+        return 0.9 if excerpt.strip() else 0.1
+
     async def decide(self, request: DecisionRequest) -> BackendResult:
         answers = self.decide_sync(request)
         return BackendResult(answers=answers, model_version=self.model_version, questions_sent={}, latency_ms=0.0)

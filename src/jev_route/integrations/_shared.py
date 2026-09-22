@@ -889,6 +889,9 @@ def decision_signals(
         "tier": decision.tier,
         "model": decision.model,
         "rule_id": decision.rule_id,
+        # The outcome verifier needs this: gate-blocked content is never sent
+        # anywhere, including to a verification backend.
+        "gate_blocked": bool(decision.gate.blocks_backend or decision.gate.force_local),
         "reason": decision.reason,
         "complexity": answers.complexity.choice,
         "complexity_confidence": round(float(answers.complexity.confidence), 4),

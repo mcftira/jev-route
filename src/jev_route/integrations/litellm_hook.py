@@ -63,6 +63,22 @@ from ._shared import LOGGER, ROUTABLE_CALL_TYPES, SIGNALS_KEY
 RouterFactory = Callable[[], Router]
 
 
+def _extract_response_text(response_obj: Any) -> str:
+    """Best-effort response text for the verifier; empty string when the shape
+    is unrecognised (the verifier treats empty as a low-confidence signal,
+    never as a crash)."""
+    try:
+        choices = getattr(response_obj, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None and getattr(msg, "content", None):
+                return str(msg.content)
+        text = getattr(response_obj, "text", None)
+        return str(text) if text else ""
+    except Exception:
+        return ""
+
+
 class JevRoutePreCallHook(CustomLogger):
     """Rewrites ``data["model"]`` on the proxy to the model jev-route chose.
 
@@ -118,6 +134,8 @@ class JevRoutePreCallHook(CustomLogger):
             "*" if "*" in instance.managed_models else ", ".join(sorted(instance.managed_models)),
         )
         return instance
+
+    _outcome_verifier: Any = None
 
     @property
     def managed_models(self) -> frozenset[str]:
@@ -295,10 +313,43 @@ class JevRoutePreCallHook(CustomLogger):
                     summary.get("model"),
                     model,
                 )
+                await self._verify_outcome(kwargs, response_obj, summary)
             else:
                 LOGGER.debug("jev-route: success event for model=%s with no jev-route metadata.", model)
         except Exception as exc:  # broad except, deliberately: observation must never break a response
             LOGGER.debug("jev-route: async_log_success_event failed (%s); ignoring.", exc)
+
+    async def _verify_outcome(self, kwargs: dict, response_obj: Any, summary: dict) -> None:
+        """Outcome verification (v0.3): one noul on the configured backend,
+        appended as a `jev_route.outcome` record linked by request_id.
+
+        Standing rules (from the work order, non-negotiable): never verify
+        gate-blocked content; a failed verification logs completed_p=None and
+        never touches the response; default-off in the policy."""
+        try:
+            cfg = {}
+            raw = getattr(self.router.policy, "raw", None)
+            if isinstance(raw, dict):
+                cfg = raw.get("outcome_verification", {}) or {}
+            if not cfg.get("enabled", False):
+                return
+            from ..outcome import OutcomeVerifier
+
+            if self._outcome_verifier is None:
+                self._outcome_verifier = OutcomeVerifier(
+                    self.router.backend, self.router.sink,
+                    sample_rate=float(cfg.get("sample_rate", 1.0)),
+                )
+            response_text = _extract_response_text(response_obj)
+            await self._outcome_verifier.maybe_verify(
+                request_id=str(summary.get("request_id") or ""),
+                request_summary=str(summary.get("excerpt") or "")[:500],
+                response_excerpt=response_text,
+                model_served=str(summary.get("model") or ""),
+                gate_blocked=bool(summary.get("gate_blocked")),
+            )
+        except Exception as exc:  # observation must never break a response
+            LOGGER.debug("jev-route: outcome verification failed (%s); ignoring.", exc)
 
     async def async_log_failure_event(
         self,

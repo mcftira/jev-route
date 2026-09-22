@@ -65,6 +65,11 @@ class TraceBackend:
             latency_ms=1.0,
         )
 
+    def noul(self, state: Any, instructions: str) -> float:
+        """Outcome seam for the backtest: synthetic completion scores, slightly
+        tier-dependent so the report's per-model rates differ (illustrative)."""
+        return {"local": 0.85, "cheap": 0.92, "strong": 0.97}.get(str(self._row["expected_tier"]), 0.9)
+
 
 class NullSink:
     """The backtest measures; it does not train on its own replays."""
@@ -101,6 +106,10 @@ class BacktestReport:
     cost_ours: float = 0.0
     cost_baseline: float = 0.0
     rows: list[BacktestRow] = field(default_factory=list)
+    #: Phase 1 outcome verification: % of routed requests with a verified
+    #: outcome, and per-tier completion rates (synthetic in the backtest).
+    verified_outcomes: int = 0
+    completion_by_tier: dict[str, list[float]] = field(default_factory=dict)
 
     @property
     def savings_pct(self) -> float:
@@ -147,6 +156,21 @@ async def run_backtest(
         report.gate_fires += int(gate_fired)
         report.cost_ours += report.rows[-1].cost_ours
         report.cost_baseline += report.rows[-1].cost_baseline
+        # Phase 1: outcome verification on the same pass (never on blocked rows).
+        if not gate_fired:
+            from .outcome import OutcomeVerifier
+
+            verifier = OutcomeVerifier(router.backend, NullSink())
+            rec = await verifier.maybe_verify(
+                request_id=row["id"],
+                request_summary=row["text"][:500],
+                response_excerpt=f"synthetic response for {row['category']}",
+                model_served=decision.model,
+                gate_blocked=False,
+            )
+            if rec is not None and rec.completed_p is not None:
+                report.verified_outcomes += 1
+                report.completion_by_tier.setdefault(tier, []).append(rec.completed_p)
     return report
 
 
@@ -349,5 +373,22 @@ def render_report(report: BacktestReport, *, trace_path: str, policy_name: str) 
         "> Honest reading: the oracle replay makes the headline a routing-distribution number on a",
         "> synthetic traffic mix, not a model-quality claim. Swap in a real classifier and the tiers",
         "> (and the dollars) move; the Gate section above does not, because the gate is deterministic.",
+        "",
+        "## Outcome verification (synthetic)",
+        "",
+        f"* verified outcomes: **{report.verified_outcomes}/{report.total}** routed requests",
+        "* per-tier completion rate (Phase 1 plumbing check -- synthetic scores):",
+        "",
+        "| tier | n | mean completion p |",
+        "|---|---|---|",
+    ]
+    for tier, ps in sorted(report.completion_by_tier.items()):
+        mean = sum(ps) / len(ps) if ps else 0.0
+        lines.append(f"| {tier} | {len(ps)} | {mean:.2f} |")
+    lines += [
+        "",
+        "> On live traffic these numbers come from the real decision backend; here",
+        "> they prove the plumbing (the first 'is the routing actually good' number,",
+        "> distinct from cost).",
     ]
     return chr(10).join(lines) + chr(10)
