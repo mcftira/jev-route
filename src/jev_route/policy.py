@@ -431,7 +431,7 @@ class Policy:
     #: backend construction. Adoption only ever flips to compiled after the
     #: three-part gate in the work order passes.
     questions: str = "handwritten"
-    compiled_questions_path: str = "policy/compiled_questions.yaml"
+    compiled_questions_path: str = "policies/compiled_questions.yaml"
     source: str | None = None
     #: The document this policy was parsed from, kept verbatim so
     #: :meth:`with_overrides` can round-trip back to YAML without losing comments
@@ -500,7 +500,7 @@ class Policy:
             failure=failure,
             tandem=tandem,
             questions=questions_mode,
-            compiled_questions_path=str(raw.get("compiled_questions_path", "policy/compiled_questions.yaml")),
+            compiled_questions_path=str(raw.get("compiled_questions_path", "policies/compiled_questions.yaml")),
             pii_threshold=float(raw.get("pii_threshold", 0.5)),
             backend=dict(raw.get("backend") or {}),
             gate=dict(gate_raw),

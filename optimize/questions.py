@@ -181,4 +181,6 @@ def provenance_header(*, baseline_score: float, compiled_score: float, seed: int
 
 
 def write_compiled(out_path: str | Path, compiled_blob: str, header: str) -> None:
-    Path(out_path).write_text(header + compiled_blob)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(header + compiled_blob)

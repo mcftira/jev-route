@@ -473,7 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("optimize-questions", help="GEPA-compile routing question wording (manual, keyed; never in CI)")
     p.add_argument("--trace", default="traces/demo_500.jsonl")
     p.add_argument("--policy", default="policies/default.yaml")
-    p.add_argument("--out", default="policy/compiled_questions.yaml")
+    p.add_argument("--out", default="policies/compiled_questions.yaml")
     p.add_argument("--max-metric-calls", type=int, default=150)
     p.add_argument("--seed", type=int, default=20260922)
     p.add_argument("--reflection-model", default="openai/w/models/Qwen3.8-27B-Q8_0.gguf",
