@@ -13,6 +13,18 @@ policy do to cost on realistic traffic?* It replays a JSONL trace twice:
 
 The headline number (cost delta %) is honest about what it is: the policy's
 effect on a synthetic-but-realistic traffic mix, not a model-quality claim.
+
+An *intent cache* can be attached (``intent_cache=``) to measure what the
+near-duplicate shortcut in front of the router would have replayed. It is
+checked before routing, on the same gate contract the live adapter uses: the
+deterministic local gate is scanned first (it is local and never calls a
+network), so a gate-fired row is never served from the cache and never stored
+in it -- it can only be routed fresh. A hit replays the cached decision: no
+gate pass, no backend call, no log record, and no outcome verification,
+because a replay produces no fresh response to verify. The report then gains
+a hit-rate section splitting exact / near-duplicate / semantic hits, plus the
+``semantic_suspicious`` counter for false semantic replays. With no cache
+attached, the run and the report are exactly what they were before.
 """
 
 from __future__ import annotations
@@ -25,8 +37,10 @@ from typing import Any, ClassVar
 
 from .backends.base import BackendResult
 from .cache import NullCache
+from .intent_cache import IntentCache
 from .policy import Policy
 from .pricing import DEFAULT_OUTPUT_TOKENS, estimate_cost_usd, prices_from_policy
+from .prompts import excerpt_from_text
 from .router import Router
 from .schema import ChoiceAnswer, DecisionAnswers, NoulAnswer
 
@@ -110,6 +124,10 @@ class BacktestReport:
     #: outcome, and per-tier completion rates (synthetic in the backtest).
     verified_outcomes: int = 0
     completion_by_tier: dict[str, list[float]] = field(default_factory=dict)
+    #: Phase 4: ``IntentCache.stats()`` snapshot when an intent cache is
+    #: attached, else ``None`` -- and no hit-rate section in the report, so an
+    #: unattached run renders byte-identical to before.
+    intent_cache_stats: dict[str, Any] | None = None
 
     @property
     def savings_pct(self) -> float:
@@ -127,13 +145,46 @@ async def run_backtest(
     trace_path: str | Path,
     policy: Policy,
     output_tokens: int = DEFAULT_OUTPUT_TOKENS,
+    intent_cache: IntentCache | None = None,
 ) -> BacktestReport:
+    """Replay the trace; attach an :class:`IntentCache` to also measure what
+    the near-duplicate shortcut in front of the router would have replayed.
+
+    The cache is fully built by the caller (``build_intent_cache`` plus the
+    seam the deployment wires), so the backtest itself makes no model calls --
+    the same offline contract as the rest of the harness. See the module
+    docstring for the gate-first contract and what a hit skips.
+    """
     prices = prices_from_policy(policy.raw if isinstance(policy.raw, Mapping) else {})
     rows = [json.loads(line) for line in Path(trace_path).read_text().splitlines() if line.strip()]
     report = BacktestReport(total=len(rows))
     for row in rows:
         router = Router(policy, TraceBackend(row), sink=NullSink(), cache=NullCache())
-        decision = await router.route_text(row["text"], request_id=row["id"])
+        hit = None
+        gate_fires = False
+        if intent_cache is not None:
+            # Gate-first: the local gate is deterministic and never calls a
+            # network, so the backtest scans it before consulting the cache,
+            # on the same excerpt the pipeline would scan. That is what makes
+            # the standing rule verifiable in code: a fired row hands its
+            # verdict to the cache (a counted no-op lookup, no store), so a
+            # gate-fired request is neither served from the cache nor stored
+            # in it -- not even as a near-duplicate or semantic candidate.
+            verdict = router.gate.scan(excerpt_from_text(row["text"], max_chars=router.max_excerpt_chars))
+            gate_fires = bool(verdict.fired or verdict.force_local or verdict.blocks_backend)
+            hit = intent_cache.lookup(row["text"], gate_fired=gate_fires)
+        if hit is not None:
+            decision = hit.decision
+            cache_served = True
+        else:
+            decision = await router.route_text(row["text"], request_id=row["id"])
+            cache_served = False
+            if intent_cache is not None and not gate_fires:
+                # Store with the pipeline's own verdict: if a stricter layer
+                # fired than the pre-scan saw, the store is a counted no-op
+                # and the fired decision never becomes a candidate.
+                decision_fired = bool(decision.gate.fired or decision.gate.force_local or decision.gate.blocks_backend)
+                intent_cache.store(row["text"], decision, gate_fired=decision_fired)
         gate_fired = bool(decision.gate.fired or decision.gate.force_local or decision.gate.blocks_backend)
         advisory = set(decision.gate.advisory_topics)
         detectors = tuple(f.detector for f in decision.gate.findings if f.detector not in advisory)
@@ -156,8 +207,10 @@ async def run_backtest(
         report.gate_fires += int(gate_fired)
         report.cost_ours += report.rows[-1].cost_ours
         report.cost_baseline += report.rows[-1].cost_baseline
-        # Phase 1: outcome verification on the same pass (never on blocked rows).
-        if not gate_fired:
+        # Phase 1: outcome verification on the same pass (never on blocked
+        # rows, and never on cache hits: a replay produces no fresh response,
+        # so there is nothing new to verify).
+        if not gate_fired and not cache_served:
             from .outcome import OutcomeVerifier
 
             verifier = OutcomeVerifier(router.backend, NullSink())
@@ -171,6 +224,8 @@ async def run_backtest(
             if rec is not None and rec.completed_p is not None:
                 report.verified_outcomes += 1
                 report.completion_by_tier.setdefault(tier, []).append(rec.completed_p)
+    if intent_cache is not None:
+        report.intent_cache_stats = dict(intent_cache.stats())
     return report
 
 
@@ -320,6 +375,43 @@ def _gate_section(report: BacktestReport) -> list[str]:
     return lines
 
 
+def _intent_cache_section(report: BacktestReport) -> list[str]:
+    """Phase 4: the hit-rate split of an attached intent cache.
+
+    Absent cache -> absent section: the report stays byte-identical to v0.3."""
+    stats = report.intent_cache_stats
+    if stats is None:
+        return []
+    hits = int(stats.get("hits", 0))
+    misses = int(stats.get("misses", 0))
+    total = hits + misses
+    rate = f"{hits / total:.1%}" if total else "0.0%"
+    floor = float(stats.get("semantic_overlap_floor", 0.3))
+    lines = [
+        "## Intent cache (hit rate)",
+        "",
+        f"* attached: yes (semantic pass: {'on' if stats.get('semantic') else 'off'}). Checked before routing:",
+        "  a hit replays the cached decision and skips the gate pass, the backend call, and the log record.",
+        f"* **{hits} of {total}** non-gated requests served from the cache (hit rate {rate}).",
+        f"* gate-fired rows ({report.gate_fires}) never touch the cache: not served from it, not stored in it.",
+        "",
+        "| hit kind | count | what decided it |",
+        "|---|---:|---|",
+        f"| exact (normalized) | {int(stats.get('exact_hits', 0))} | NFKC + casefold + whitespace collapse |",
+        f"| near-dup (token Jaccard) | {int(stats.get('near_hits', 0))} | overlap at/above the Jaccard threshold |",
+        f"| semantic (batched noul) | {int(stats.get('semantic_hits', 0))} | one batched noul over top-K (<=5) |",
+        "",
+    ]
+    suspicious = int(stats.get("semantic_suspicious", 0))
+    lines.append(
+        f"* **semantic_suspicious: {suspicious}** of the semantic hits above -- replayed, but the noul answered "
+        f"'same intent and same constraints' while token overlap with the replayed summary is below the {floor:.2f} "
+        "floor. A false replay must be visible; review these before trusting the semantic pass."
+    )
+    lines.append("")
+    return lines
+
+
 def render_report(report: BacktestReport, *, trace_path: str, policy_name: str) -> str:
     mix = _mix_description(report)
     lines = [
@@ -350,6 +442,7 @@ def render_report(report: BacktestReport, *, trace_path: str, policy_name: str) 
         share = n / report.total * 100.0 if report.total else 0.0
         lines.append(f"| {tier} | {n} | {share:.1f}% |")
     lines.append("")
+    lines += _intent_cache_section(report)
     lines += _gate_section(report)
     lines += [
         "## Method and reproducibility",
@@ -377,6 +470,15 @@ def render_report(report: BacktestReport, *, trace_path: str, policy_name: str) 
         "## Outcome verification (synthetic)",
         "",
         f"* verified outcomes: **{report.verified_outcomes}/{report.total}** routed requests",
+    ]
+    if report.intent_cache_stats is not None:
+        served = int(report.intent_cache_stats.get("hits", 0))
+        if served:
+            lines.append(
+                f"* {served} request(s) served from the intent cache are excluded: a replay produces no "
+                "fresh response, so there is nothing new to verify."
+            )
+    lines += [
         "* per-tier completion rate (Phase 1 plumbing check -- synthetic scores):",
         "",
         "| tier | n | mean completion p |",
