@@ -157,6 +157,21 @@ Reproduce — keyless:
 python evals/injection/run.py
 ```
 
+## Why route by sensitivity, not just cost
+
+An independent September 2026 synthesis of TypeSafe founder Diogo Almeida's
+design notes ("Jev Engineering for Coding Agents") argues the same thesis we
+built this on: **difficulty and cost are not the only reasons to route -- data
+sensitivity is.** Its routing table (public docs -> cheapest, application code
+-> vetted, secrets/env/infra config -> first-party only, proprietary research
+-> exclude named vendors) is, almost verbatim, this project's hard gate plus
+tier policy. The same notes carry the sharpest warning in the space: the
+**routing trap** -- delegating to a cheap model costs a context-load down and
+a reprocessing pass back, and loses money at realistic session shapes. Our
+answer is request-level routing on small bounded excerpts, which never pays
+the context-rebuild term; [docs/routing-trap.md](docs/routing-trap.md) shows
+the arithmetic. Independent synthesis, not affiliated with TypeSafe.
+
 ## How is this different
 
 **LiteLLM native JEV classifier.** LiteLLM shipped a native complexity classifier, and platform-side complexity routing is a commodity now. What it does not have: a sensitivity layer, decision logging, distillation — and custom tiers are Enterprise-gated. jev-route is the sensitivity + self-ownership layer. A thin LiteLLM adapter (`integrations/`), shipping in v0.3, lets LiteLLM users run the gate inside their own auto_router config.
