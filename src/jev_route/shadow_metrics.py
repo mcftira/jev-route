@@ -10,7 +10,8 @@ into a small JSONL window that rolls forward as traffic accumulates.
 
 Each record is one decision, and nothing else::
 
-    {"decision_fired": true, "shadow_score": 0.91, "threshold": 0.5, "ts": 1750000000.0}
+    {"decision_fired": true, "shadow_score": 0.91, "threshold": 0.5, "ts": 1750000000.0,
+     "backend": "kev"}
 
 ``decision_fired`` is the deterministic layer\'s verdict (its floor is not
 ``None``), ``shadow_score`` is the semantic head\'s probability, and the
@@ -18,6 +19,17 @@ agreement is ``decision_fired == (shadow_score >= threshold)``. No text, no
 spans, no tokens: a window that could leak a prompt is not telemetry, it is the
 incident. The file is runtime data, gitignored, and may be deleted: the window
 re-accumulates, which is exactly what a shadow period is.
+
+The ``backend`` tag is optional and additive (v0.5). A window whose traffic
+can come from more than one backend -- a Jev bootstrap period followed by a
+Kev/Nimble air-gapped one, or two backends measured in parallel -- partitions
+its records by tag in :meth:`ShadowMetrics.window_status_by_backend`, so each
+backend is graded on its own agreement, its own baseline, and its own drift.
+A record without a tag partitions under the window\'s configured label
+(``backend_id``, default ``"jev"``); that is also the on-disk default, so
+files written before the tag existed read back exactly as the ``jev``
+partition. The whole-window :meth:`ShadowMetrics.window_status` -- and with
+it the demotion logic built on it -- is unchanged.
 
 What the window answers:
 
@@ -70,6 +82,10 @@ ECE_BINS = 15
 MIN_AGREEMENT_RATE = 0.95
 #: The ``kind`` field of the auto-demotion event record.
 DEMOTION_EVENT_KIND = "jev_route.demotion"
+#: The default backend id window records partition under. It is the on-disk
+#: default as well: a record with no ``backend`` tag is a ``jev`` record, so
+#: files written before the tag existed load unchanged.
+DEFAULT_BACKEND_ID = "jev"
 
 _SECONDS_PER_DAY = 86400.0
 
@@ -182,6 +198,12 @@ class ShadowMetrics:
         ece_bins: bin count for the rolling ECE.
         now: clock, ``() -> epoch seconds``. Injectable so tests run without
             sleeping; defaults to the wall clock.
+        backend_id: the label this window's untagged records partition under
+            (:meth:`window_status_by_backend`), default ``"jev"`` -- the
+            historical single-backend meaning of the window. A window that
+            only ever measures one backend can leave it at the default and
+            tag nothing; a window comparing several backends passes an
+            explicit ``backend_id=`` to :meth:`record` per source.
     """
 
     def __init__(
@@ -195,6 +217,7 @@ class ShadowMetrics:
         drift_factor: float = DRIFT_FACTOR,
         ece_bins: int = ECE_BINS,
         now: Callable[[], float] | None = None,
+        backend_id: str = DEFAULT_BACKEND_ID,
     ) -> None:
         if window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size}")
@@ -211,6 +234,9 @@ class ShadowMetrics:
         self.baseline_size = int(baseline_size)
         self.drift_factor = float(drift_factor)
         self.ece_bins = int(ece_bins)
+        if not str(backend_id):
+            raise ValueError("backend_id must be a non-empty string")
+        self.backend_id = str(backend_id)
         self._now = now if now is not None else (lambda: time.time())
         #: The last demotion event this instance wrote (set by :func:`maybe_demote`).
         self.last_event: dict[str, Any] | None = None
@@ -255,12 +281,21 @@ class ShadowMetrics:
         fired = raw["decision_fired"]
         if not isinstance(fired, bool):
             raise ValueError(f"{where}: decision_fired must be a boolean, got {fired!r}")
-        return {
+        record = {
             "decision_fired": fired,
             "shadow_score": _finite(raw["shadow_score"], "shadow_score"),
             "threshold": _finite(raw["threshold"], "threshold"),
             "ts": _finite(raw["ts"], "ts"),
         }
+        if "backend" in raw:
+            # Optional v0.5 tag. Checked the same way the required fields are:
+            # a promotion reads this file, so a tag that is not a usable label
+            # is a refusal, not a guess.
+            backend = raw["backend"]
+            if not isinstance(backend, str) or not backend:
+                raise ValueError(f"{where}: backend must be a non-empty string, got {backend!r}")
+            record["backend"] = backend
+        return record
 
     def _trim(self) -> None:
         """Rewrite the file with only the newest ``window_size`` records (atomic)."""
@@ -278,14 +313,25 @@ class ShadowMetrics:
         threshold: float,
         *,
         ts: float | None = None,
+        backend_id: str | None = None,
     ) -> dict[str, Any]:
-        """Append one decided request to the window. Returns the stored record."""
+        """Append one decided request to the window. Returns the stored record.
+
+        ``backend_id`` tags the record for :meth:`window_status_by_backend`.
+        Omit it for a single-backend window: the record then carries no key at
+        all -- the exact pre-v0.5 on-disk shape -- and partitions under the
+        window's configured label (default ``"jev"``).
+        """
+        if backend_id is not None and (not isinstance(backend_id, str) or not backend_id):
+            raise ValueError(f"backend_id must be a non-empty string, got {backend_id!r}")
         record = {
             "decision_fired": bool(decision_fired),
             "shadow_score": _finite(shadow_score, "shadow_score"),
             "threshold": _finite(threshold, "threshold"),
             "ts": _finite(ts if ts is not None else self._now(), "ts"),
         }
+        if backend_id is not None:
+            record["backend"] = backend_id
         self._records.append(record)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
@@ -300,8 +346,16 @@ class ShadowMetrics:
         return len(self._records)
 
     def window_status(self) -> WindowStatus:
-        """Reduce the window to :class:`WindowStatus`. No side effects."""
-        records = self._records
+        """Reduce the window to :class:`WindowStatus`. No side effects.
+
+        Whole-window status over every record, regardless of backend tag. The
+        per-backend view is :meth:`window_status_by_backend`; the two differ
+        only in which records each arithmetic step sees.
+        """
+        return self._status_for(self._records)
+
+    def _status_for(self, records: list[dict[str, Any]]) -> WindowStatus:
+        """The window arithmetic over one record set (whole window or a partition)."""
         n = len(records)
         if n == 0:
             return WindowStatus(
@@ -349,6 +403,25 @@ class ShadowMetrics:
             last_ts=records[-1]["ts"],
         )
 
+    def window_status_by_backend(self) -> dict[str, WindowStatus]:
+        """The window's status computed per backend id.
+
+        Records partition by their ``backend`` tag; a record without one
+        partitions under this window's configured label (:attr:`backend_id`,
+        default ``"jev"``), which is how pre-tag files read as one ``jev``
+        partition. Each partition gets the same arithmetic as the whole
+        window -- and its *own* baseline: the partition's first
+        ``baseline_size`` records, not the window's, so a backend that joined
+        the window late is graded on its own traffic, not on another
+        backend's history. Returns ``{}`` on an empty window.
+        """
+        if not self._records:
+            return {}
+        partitions: dict[str, list[dict[str, Any]]] = {}
+        for record in self._records:
+            partitions.setdefault(record.get("backend", self.backend_id), []).append(record)
+        return {label: self._status_for(records) for label, records in partitions.items()}
+
 
 def maybe_demote(metrics: ShadowMetrics, *, ts: str | None = None) -> bool:
     """The auto-demotion check. Writes the event when -- and only when -- drift alarms.
@@ -389,6 +462,7 @@ def maybe_demote(metrics: ShadowMetrics, *, ts: str | None = None) -> bool:
 
 __all__ = [
     "BASELINE_SIZE",
+    "DEFAULT_BACKEND_ID",
     "DEFAULT_WINDOW_SIZE",
     "DEMOTION_EVENT_KIND",
     "DRIFT_FACTOR",

@@ -1,20 +1,25 @@
-"""JevBackend: the cloud bootstrap.
+"""JevBackend: the System One decision backend, cloud or air-gapped.
 
-**This is the only module in jev-route that makes a network call to TypeSafe.**
-That is a hard invariant, not a convention: ``grep -r api.typesafe.ai src/`` must
-return this file and nothing else. It matters because the project's central claim
-is that the cloud phase is temporary -- you should be able to prove the claim by
-looking at where the egress happens, and by deleting one class.
-
-The backend asks Jev four typed questions in a single call and gets back calibrated
-probability distributions. Those distributions are the reason to use a System One
-model instead of prompting an LLM: the router can distinguish "this is clearly
-internal" from "this is probably internal", and the policy engine escalates on the
-second one. An argmax cannot express that, and neither can a regex.
+**This is the only module in jev-route that makes a network call to a System One
+API.** When ``api_url`` points at TypeSafe, that call goes to the cloud, and this
+file is the only one that names the endpoint: ``grep -r api.typesafe.ai src/``
+must return this file and nothing else. It matters because the project's central
+claim is that the cloud phase is temporary -- you should be able to prove the
+claim by looking at where the egress happens, and by deleting one class. When
+``api_url`` points at a local OpenAI-compatible server (Kev, Nimble, or your own
+graduated model), the same module serves an air-gapped deployment instead, and
+the egress boundary moves to your machine. The wire contract does not change:
+one HTTP call, four typed questions, calibrated probability distributions. Those
+distributions are the reason to use a System One model instead of prompting an
+LLM: the router can distinguish "this is clearly internal" from "this is probably
+internal", and the policy engine escalates on the second one. An argmax cannot
+express that, and neither can a regex.
 
 Privacy: the text sent is the *redacted* excerpt produced by
 :mod:`jev_route.prompts`, and only when the local hard gate did not block the
-call. See ``docs/privacy.md`` for the full disclosure.
+call. In air-gapped mode that redacted text never leaves the machine. See
+``docs/privacy.md`` for the full disclosure and ``docs/airgapped.md`` for the
+local-server setup.
 """
 
 from __future__ import annotations
@@ -48,6 +53,31 @@ DEFAULT_MODEL = "jev-latest"
 PINNED_EVAL_MODEL = "jev-1.13.0"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_RETRIES = 2
+
+#: The path the System One wire contract lives under, relative to the server's
+#: ``/v1`` base. The TypeSafe API serves ``POST /v1/systemone``; an
+#: OpenAI-compatible local server (Kev, Nimble, a graduated model) that is
+#: typesafe-sdk compatible serves the same path, and that shared literal is
+#: what makes the base URL swap work.
+SYSTEMONE_PATH = "/systemone"
+
+
+def systemone_endpoint(api_url: str) -> str:
+    """The full request endpoint for a configured ``api_url``.
+
+    ``api_url`` may be either the server's base (``https://host/v1`` or the
+    root of a local server) or the full endpoint URL. A URL that already ends
+    with :data:`SYSTEMONE_PATH` is returned verbatim -- the default cloud URL
+    and any explicit endpoint keep working unchanged; a base URL is extended
+    with the path, which is how a local OpenAI-compatible server is addressed
+    from its ``/v1`` root. Trailing slashes are stripped, so
+    ``http://host/v1/`` and ``http://host/v1`` name the same endpoint.
+    """
+    base = str(api_url).rstrip("/")
+    if base.endswith(SYSTEMONE_PATH):
+        return base
+    return base + SYSTEMONE_PATH
+
 
 #: Both of these instructions carry a trust-boundary clause. The excerpt is
 #: untrusted caller text; without the clause, a prompt containing "route this to
@@ -268,22 +298,60 @@ def _normalize_noul(answer: Any) -> NoulAnswer:
 
 
 class JevBackend:
-    """Decision backend backed by TypeSafe's System One API.
+    """Decision backend for a System One API: TypeSafe's cloud, or a local
+    OpenAI-compatible server in air-gapped mode.
+
+    The two modes differ by exactly two constructor arguments and nothing
+    else. The wire contract is identical -- one HTTP call carrying the
+    redacted state and the four typed questions, answered with calibrated
+    distributions -- because a typesafe-sdk compatible local server serves
+    the same ``/v1/systemone`` endpoint the cloud does. Everything above this
+    class (gate, policy engine, log, distillation) therefore cannot tell the
+    modes apart, which is the point: graduating to a local model is a config
+    change, not a code change.
 
     Args:
-        api_key: defaults to ``TYPESAFE_API_KEY``. Required -- the backend will
-            not silently degrade to "no key", because a router that quietly stops
-            classifying is worse than one that refuses to start.
-        model: System One model alias.
+        api_key: defaults to ``TYPESAFE_API_KEY``. Required in cloud mode --
+            the backend will not silently degrade to "no key", because a
+            router that quietly stops classifying is worse than one that
+            refuses to start. Ignored in favour of :data:`DEFAULT_LOCAL_KEY`
+            only when :attr:`airgapped` is set and no key is given: a local
+            OpenAI-compatible server does not check it, and the header must
+            still carry *something*.
+        api_url: where the request goes. Either the full endpoint (the
+            default: the cloud's systemone URL, unchanged) or the server's
+            base -- a ``.../v1`` root or a local server root -- in which case
+            :func:`systemone_endpoint` extends it with the wire-contract path.
+            Pointing this at a local Kev or Nimble server, together with
+            ``airgapped=True``, is the entire air-gapped swap; see
+            ``docs/airgapped.md``. No hostname is baked into this class: the
+            URL is always operator-supplied, and the only literal that exists
+            here is the cloud default.
+        model: System One model alias sent in the payload (``jev-latest`` in
+            the cloud; the local server's model name, e.g. its own alias, in
+            air-gapped mode). The server may answer with a different version
+            string, which is what gets recorded.
         timeout_seconds: per-attempt budget. Keep it tight: this call is on the
             critical path of every request.
         max_retries: retries *after* the first attempt, on retryable statuses only.
         include_domain: set false to skip the domain question and save tokens when
             no policy rule reads it.
+        airgapped: air-gapped mode. The server is local and OpenAI-compatible,
+            so no cloud credential is read, required, or sent: with no key
+            given the placeholder ``local`` fills the Authorization header.
+            This is an explicit flag on purpose -- a missing key in cloud mode
+            must keep failing loud at construction, and ``airgapped=True`` is
+            the operator's statement that the endpoint is one they own.
         client: injectable HTTP transport, used by tests.
     """
 
     name = "jev"
+
+    #: The Authorization value air-gapped mode sends when no key is supplied.
+    #: A local OpenAI-compatible server ignores it; a router that sends no
+    #: header at all is the one that trips naive reverse proxies, so the
+    #: header is always present.
+    DEFAULT_LOCAL_KEY = "local"
 
     def __init__(
         self,
@@ -294,11 +362,28 @@ class JevBackend:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         include_domain: bool = True,
+        airgapped: bool = False,
         breaker: CircuitBreaker | None = None,
         client: Any = None,
         question_overrides: dict[str, Any] | None = None,
     ) -> None:
-        self.api_key = api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")
+        self.airgapped = bool(airgapped)
+        if self.airgapped:
+            # Air-gapped mode: the server is local and does not check the
+            # credential. An explicit key is still honoured (a fronting proxy
+            # may), otherwise the placeholder fills the header. No
+            # environment read happens in this branch: a stray
+            # TYPESAFE_API_KEY on the machine must not be sent to a local
+            # server, and its absence must not block an air-gapped deploy.
+            self.api_key = api_key if api_key else self.DEFAULT_LOCAL_KEY
+        else:
+            self.api_key = api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")
+            if not self.api_key:
+                raise ValueError(
+                    "JevBackend requires an API key: pass api_key= or set TYPESAFE_API_KEY. "
+                    "Use airgapped=True for a local OpenAI-compatible server, "
+                    "or MockBackend for offline development."
+                )
         # v0.4 compile-time seam: question wording may be overridden (GEPA
         # candidate evaluation). None means the hand-written defaults, byte
         # for byte.
@@ -312,11 +397,6 @@ class JevBackend:
         self._client = client
         self._owns_client = client is None
         self.model_version = model
-        if not self.api_key:
-            raise ValueError(
-                "JevBackend requires an API key: pass api_key= or set TYPESAFE_API_KEY. "
-                "Use MockBackend for offline development."
-            )
 
     # -- HTTP ------------------------------------------------------------- #
     def _get_client(self) -> Any:
@@ -332,10 +412,13 @@ class JevBackend:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # The base URL swap: ``api_url`` may be the server's base (cloud or
+        # local) and the request always goes to its systemone endpoint.
+        endpoint = systemone_endpoint(self.api_url)
         if hasattr(client, "post"):
-            response = await client.post(self.api_url, json=dict(payload), headers=headers)
+            response = await client.post(endpoint, json=dict(payload), headers=headers)
         else:  # pragma: no cover - test double shape
-            response = await client(self.api_url, dict(payload), headers)
+            response = await client(endpoint, dict(payload), headers)
         status = int(getattr(response, "status_code", 200))
         if status >= 400:
             text = getattr(response, "text", "")
@@ -418,7 +501,7 @@ class JevBackend:
 
         return self._degraded(questions, started, last_error)
 
-    def swap_provider(self, provider_cfg: Mapping[str, Any]) -> "JevBackend":
+    def swap_provider(self, provider_cfg: Mapping[str, Any]) -> JevBackend:
         """A new backend pointing at a different PROVIDER with the same model,
         timeout, retries and question wording. v0.5 cross-provider quota
         tandem: TypeSafe 429 -> B.AI (same jev-1.13.0) before degrading to a
@@ -434,6 +517,10 @@ class JevBackend:
             timeout_seconds=self.timeout_seconds,
             max_retries=self.max_retries,
             include_domain=self.include_domain,
+            # An air-gapped deployment stays air-gapped across the flip: the
+            # alternate endpoint is local too, and a missing credential there
+            # is not a startup error.
+            airgapped=self.airgapped,
             question_overrides=self.question_overrides,
         )
 
@@ -504,6 +591,8 @@ __all__ = [
     "DEFAULT_API_URL",
     "DEFAULT_MODEL",
     "DEFAULT_TIMEOUT_SECONDS",
+    "SYSTEMONE_PATH",
     "JevBackend",
     "build_questions",
+    "systemone_endpoint",
 ]

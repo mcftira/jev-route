@@ -79,6 +79,11 @@ def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides:
             timeout_seconds=float(cfg.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
             max_retries=int(cfg.get("max_retries", 2)),
             include_domain=bool(cfg.get("include_domain", True)),
+            # v0.5 air-gapped mode: the same backend, pointed at a local
+            # OpenAI-compatible systemone server, with no cloud credential
+            # read or required. The flag, not the URL, decides whether a
+            # missing key is a startup error.
+            airgapped=bool(cfg.get("airgapped", False)),
             question_overrides=_compiled_question_overrides(policy),
         )
     if name == "distilled":

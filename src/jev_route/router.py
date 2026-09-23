@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import math
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -143,6 +144,10 @@ class Router:
     ) -> None:
         self.policy = policy
         self.backend = backend
+        #: The backend's profile, when the policy names one: a multiplicative
+        #: correction for a backend whose confidence semantics differ from the
+        #: policy's floors. See :func:`_confidence_adjust_factor`.
+        self._confidence_adjust = _confidence_adjust_factor(policy)
         # The gate always exists. There is no configuration in which it is None,
         # because there is no configuration in which unscanned text is routed.
         self.gate = gate if gate is not None else _gate_from_policy(policy)
@@ -359,6 +364,22 @@ class Router:
                 self.cache.put(cache_key, backend_result)
             classified = True
 
+            # v0.5 backend profile: a multiplicative correction for a backend
+            # whose confidence semantics differ from the policy's floors
+            # (an air-gapped Kev/Nimble student, see docs/airgapped.md).
+            # Applied before merge, escalation, and logging, so every consumer
+            # -- the confidence floors, the min_confidence mark, the decision
+            # record -- sees the corrected number, while the raw distribution
+            # stays untouched. Never applied to gate-only results (their
+            # confidence is a local artifact) or degraded ones (the policy
+            # engine ignores their confidence anyway). The cache keeps the raw
+            # result; the profile is static per router, so applying it here on
+            # every read -- cached or fresh -- is deterministic, and the
+            # replacement below builds new objects rather than mutating the
+            # cached one.
+            if self._confidence_adjust is not None and not backend_result.degraded:
+                backend_result = _apply_confidence_profile(backend_result, self._confidence_adjust)
+
             if self._shadow_enabled and _sample_hit(self._shadow_sample_rate, excerpt_hash):
                 shadow_report = await self._run_shadow(request, backend_result)
 
@@ -477,7 +498,7 @@ class Router:
                 providers = self.policy.raw.get("providers", {}) if isinstance(self.policy.raw, Mapping) else {}
                 if providers and hasattr(self.backend, "swap_provider"):
                     current = str(providers.get("__current__", "typesafe"))
-                    alternates = [p for p in providers if p != "__current__" and p != current]
+                    alternates = [p for p in providers if p not in ("__current__", current)]
                     if alternates:
                         alt_name = alternates[0]
                         alt_cfg = dict(providers[alt_name]) if isinstance(providers[alt_name], Mapping) else {}
@@ -839,6 +860,70 @@ def _gate_only_result(verdict: GateVerdict) -> BackendResult:
         latency_ms=0.0,
         degraded=False,
     )
+
+
+def _confidence_adjust_factor(policy: Policy) -> float | None:
+    """The backend's ``profile.confidence_adjust``, validated at construction.
+
+    ``backend.profile`` in the policy is a per-backend calibration profile.
+    The one knob today is ``confidence_adjust``: a multiplicative correction
+    for a backend whose reported confidences are not on the same scale as the
+    policy's confidence floors -- treating a Kev/Nimble student's 0.9 the
+    same as Jev's 0.9 is a calibration lie, so the operator corrects it once,
+    in config, and the router applies it on every decision. ``None`` (the
+    default: no ``profile`` section) means the reported confidence is
+    consumed as-is.
+
+    Refused at startup, named: a non-mapping profile or a non-numeric,
+    negative, or non-finite factor would silently mis-route every request,
+    and "the router started fine" is not a place to discover that.
+    """
+    cfg = policy.backend if isinstance(policy.backend, Mapping) else {}
+    profile = cfg.get("profile")
+    if profile is None:
+        return None
+    if not isinstance(profile, Mapping):
+        raise ValueError(f"backend.profile must be a mapping, got {type(profile).__name__}")
+    raw = profile.get("confidence_adjust")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"backend.profile.confidence_adjust must be a number, got {raw!r}")
+    factor = float(raw)
+    if not math.isfinite(factor):
+        raise ValueError(f"backend.profile.confidence_adjust must be finite, got {raw!r}")
+    if factor < 0.0:
+        raise ValueError(
+            f"backend.profile.confidence_adjust must be >= 0 (0 discards the "
+            f"backend's confidence entirely), got {raw!r}"
+        )
+    return factor
+
+
+def _apply_confidence_profile(result: BackendResult, factor: float) -> BackendResult:
+    """Multiply the backend's reported choice confidences by ``factor``, clamped to [0, 1].
+
+    Only the ``confidence`` of the three choice answers is scaled: the
+    probability *distributions* are what the log and the distillation pipeline
+    consume and must stay exactly what the backend said, and the PII noul is a
+    probability, not a confidence, so it is out of scope for the correction.
+    ``confidence_reported`` is preserved: the correction is applied to derived
+    confidences too, because the calibration concern is the backend's
+    probability estimates in general, not the reporting convention. Returns a
+    new :class:`BackendResult`; the input (which may be a cached object) is
+    not mutated.
+    """
+
+    def scaled(answer: ChoiceAnswer) -> ChoiceAnswer:
+        return replace(answer, confidence=max(0.0, min(1.0, answer.confidence * factor)))
+
+    answers = replace(
+        result.answers,
+        complexity=scaled(result.answers.complexity),
+        sensitivity=scaled(result.answers.sensitivity),
+        domain=scaled(result.answers.domain),
+    )
+    return replace(result, answers=answers)
 
 
 def _merge_gate(
