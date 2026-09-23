@@ -11,7 +11,6 @@ import pytest
 
 from jev_route.shadow_metrics import (
     BASELINE_SIZE,
-    DRIFT_FACTOR,
     REQUIRED_DAYS,
     REQUIRED_DECISIONS,
     ShadowMetrics,
@@ -73,7 +72,7 @@ def test_drift_alarm_and_demote_event(tmp_path: Path) -> None:
     status = m.window_status()
     assert status.drift_alarm
     assert maybe_demote(m)
-    events = [json.loads(l) for l in m.events_path.read_text().splitlines() if l.strip()]
+    events = [json.loads(line) for line in m.events_path.read_text().splitlines() if line.strip()]
     assert events[-1]["kind"] == "jev_route.demotion"
     # every call during an open alarm records an event (the log is the point;
     # the host polls the file, the layer stops enforcing in-process)

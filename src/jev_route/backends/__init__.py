@@ -8,8 +8,8 @@ stays ignorant of which backends exist. Adding a backend means adding a branch i
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from ..policy import Policy
@@ -22,6 +22,30 @@ from .base import (
 )
 from .jev import DEFAULT_API_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT_SECONDS, JevBackend
 from .mock import MockBackend
+
+
+def _compiled_question_overrides(policy: Policy | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Load the GEPA artifact when the policy selects ``questions: compiled``.
+
+    v0.4: adopted only when the gate has passed. The file's provenance header is
+    comment lines; the YAML body is the questions map. A missing or unparsable
+    artifact is a loud failure, never a silent fallback to handwritten -- an
+    operator who selects compiled must get compiled or an error.
+    """
+    if not isinstance(policy, Policy) or policy.questions != "compiled":
+        return None
+    import yaml
+
+    artifact = Path(policy.compiled_questions_path)
+    if not artifact.exists():
+        raise BackendError(
+            f"policy.questions is 'compiled' but {artifact} does not exist; "
+            "run `jev-route optimize-questions` or select 'handwritten'"
+        )
+    overrides = yaml.safe_load(artifact.read_text())
+    if not isinstance(overrides, dict):
+        raise BackendError(f"{artifact} did not parse to a questions mapping")
+    return overrides
 
 
 def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides: Any) -> DecisionBackend:
@@ -42,24 +66,6 @@ def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides:
     if name == "mock":
         return MockBackend(temperature=float(cfg.get("temperature", 0.55)))
     if name == "jev":
-        question_overrides = None
-        if isinstance(policy, Policy) and policy.questions == "compiled":
-            # v0.4: the GEPA artifact, adopted only when the gate has passed.
-            # The file's provenance header is comment lines; the YAML body is
-            # the questions map. A missing or unparsable artifact is a loud
-            # failure, never a silent fallback to handwritten -- an operator
-            # who selects compiled must get compiled or an error.
-            import yaml
-
-            artifact = Path(policy.compiled_questions_path)
-            if not artifact.exists():
-                raise BackendError(
-                    f"policy.questions is 'compiled' but {artifact} does not exist; "
-                    "run `jev-route optimize-questions` or select 'handwritten'"
-                )
-            question_overrides = yaml.safe_load(artifact.read_text())
-            if not isinstance(question_overrides, dict):
-                raise BackendError(f"{artifact} did not parse to a questions mapping")
         return JevBackend(
             api_key=cfg.get("api_key") or os.environ.get(str(cfg.get("api_key_env", "TYPESAFE_API_KEY")), ""),
             # Defaults are imported from .jev rather than repeated here. The whole
@@ -73,7 +79,7 @@ def build_backend(policy: Policy | Mapping[str, Any] | None = None, **overrides:
             timeout_seconds=float(cfg.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
             max_retries=int(cfg.get("max_retries", 2)),
             include_domain=bool(cfg.get("include_domain", True)),
-            question_overrides=question_overrides,
+            question_overrides=_compiled_question_overrides(policy),
         )
     if name == "distilled":
         # Imported lazily: the distilled backend needs the artifact loader and

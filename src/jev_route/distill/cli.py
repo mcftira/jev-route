@@ -1929,7 +1929,8 @@ def _gate_header(stage: str, shadow_source: str, window: Path | None) -> tuple[s
     """The report head and the evidence line for a gate-track run."""
     base = "artifact holdout" + (f" + {shadow_source}" if shadow_source != "none (offline holdout only)" else "")
     if stage == "enforce":
-        return "graduation: gate track (semantic layer, live stage: enforce)", base + f" + live shadow window ({window})"
+        label = "graduation: gate track (semantic layer, live stage: enforce)"
+        return label, base + f" + live shadow window ({window})"
     return "graduation: gate track (semantic layer, shadow -> enforce)", base
 
 
@@ -2019,7 +2020,7 @@ def _maybe_print_promotion_summary(stage: str, status: Any, eval_payload: Mappin
         _print_promotion_summary(status, eval_payload)
 
 
-def _graduate_gate(args: argparse.Namespace) -> int:
+def _graduate_gate(args: argparse.Namespace) -> int:  # noqa: PLR0912, PLR0915 -- a promotion gate enumerates criteria by design; splitting the checks would scatter the audit trail
     """Gate track: promote the semantic layer from shadow to enforce -- or refuse, with the numbers.
 
     The router track graduates the routing model and swaps the backend. The gate
