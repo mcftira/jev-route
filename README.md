@@ -302,7 +302,12 @@ jev-route plugs into exactly that seam as a `ClassifierPlugin`.
 
 ## Bootstrap on Jev
 
-Day one. Zero training data. One API key.
+Day one. Zero training data. One API key — **instant keys** at
+[console.typesafe.ai](https://console.typesafe.ai) (no waitlist; pick `jev-1.13.0`
+or the `jev-latest` alias). **[B.AI](https://b.ai)** is an official-channel
+alternative serving the same `jev-1.13.0` / `Jev-Latest`, and our
+[cross-provider quota tandem](#providers) flips to it automatically when
+TypeSafe's quota runs out — same model, someone else's quota.
 
 ```bash
 export TYPESAFE_API_KEY=...        # never committed; .env is gitignored
@@ -318,6 +323,22 @@ backend:
   max_retries: 2
   include_domain: true
 ```
+
+### Providers
+
+`providers:` in the policy names the hosted backends the router may flip
+between when one runs out of quota. TypeSafe is the default; B.AI is the
+alternate; `local` is any OpenAI-compatible `/v1/systemone` server (Kev,
+Nimble, or your own graduated model — see [docs/airgapped.md](docs/airgapped.md)).
+
+```yaml
+providers:
+  typesafe: {api_url: https://api.typesafe.ai/v1, api_key_env: TYPESAFE_API_KEY}
+  bai:      {api_url: https://api.b.ai/v1,        api_key_env: BAI_API_KEY}
+```
+
+On a 429/quota error the router flips to the alternate with the **same model**
+before degrading to a different one — the flip is logged as an escalation.
 
 One HTTP call to `POST https://api.typesafe.ai/v1/systemone` asks four typed questions in
 parallel and gets back four **distributions**, not four labels:

@@ -86,7 +86,13 @@ class QuestionEvaluator:
             overrides = yaml.safe_load(blob) or {}
         except yaml.YAMLError:
             return None
-        backend = JevBackend(api_key=self.api_key, question_overrides=overrides, include_domain=False)
+        # v0.5: compile runs pin the versioned model so their numbers reproduce
+        # (the published GEPA +21.7 was measured on jev-latest; from v0.5 the
+        # compile measures against PINNED_EVAL_MODEL and says so in provenance).
+        from jev_route.backends.jev import PINNED_EVAL_MODEL
+
+        backend = JevBackend(api_key=self.api_key, question_overrides=overrides, include_domain=False,
+                             model=PINNED_EVAL_MODEL)
         return Router(self.policy, backend, sink=NullSink(), cache=NullCache())
 
     def evaluate_one(self, candidate: dict[str, Any], example: dict[str, Any]) -> dict[str, Any]:

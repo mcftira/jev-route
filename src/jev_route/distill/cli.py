@@ -1874,7 +1874,7 @@ def _window_evidence(artifact: Any, status: Any, window_path: Path) -> dict[str,
     }
 
 
-def _live_window_checks(status: Any, eval_path: Path) -> tuple[list[Any], dict[str, Any]]:
+def _live_window_checks(status: Any, eval_path: Path, *, policy_backend_model: str | None = None) -> tuple[list[Any], dict[str, Any]]:
     """The four live criteria, as machine-checkable lines, added on top of check_promotion."""
     from ..gate_semantic import PromotionCheck
     from ..shadow_metrics import DRIFT_FACTOR, MIN_AGREEMENT_RATE
@@ -1901,6 +1901,17 @@ def _live_window_checks(status: Any, eval_path: Path) -> tuple[list[Any], dict[s
     ]
     ok, measured, payload = _injection_eval_check(eval_path)
     checks.append(PromotionCheck("injection_eval", "0 leaks / 0 FP", measured, ok))
+    # v0.5 reproducibility bar: promotion is refused on a moving alias. Every
+    # metric in the report was measured against one model version; an alias
+    # makes them unverifiable the day the alias moves.
+    if policy_backend_model is not None:
+        pinned = not policy_backend_model.endswith("-latest") and policy_backend_model != ""
+        checks.append(PromotionCheck(
+            "model_pinned",
+            "versioned model (not an alias)",
+            policy_backend_model or "(unset)",
+            pinned,
+        ))
     return checks, payload
 
 
@@ -1959,7 +1970,11 @@ def _stage_enforce_report(args: argparse.Namespace, policy: Any, criteria: Any, 
         metrics["shadow_n_examples"] = max(int(metrics.get("shadow_n_examples") or 0), status.n_decisions)
     report = check_promotion(criteria, metrics)
     eval_path = _resolve_injection_eval(args, policy)
-    live_checks, eval_payload = _live_window_checks(status, eval_path)
+    backend_model = ""
+    if policy is not None:
+        backend_cfg = policy.backend if isinstance(policy.backend, Mapping) else {}
+        backend_model = str(backend_cfg.get("model", ""))
+    live_checks, eval_payload = _live_window_checks(status, eval_path, policy_backend_model=backend_model)
     combined = PromotionReport(
         criteria=report.criteria,
         metrics={**metrics, "live_window": status.to_dict(), "injection_eval": eval_payload},

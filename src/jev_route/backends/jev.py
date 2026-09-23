@@ -39,6 +39,13 @@ from .base import BackendResult, CircuitBreaker, DecisionRequest
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
+#: The versioned model every committed measurement is pinned to (v0.5):
+#: the README's published numbers (92.3% cost delta, 0/264 injection eval,
+#: the GEPA +21.7 pts) mean nothing if the alias underneath them moves.
+#: Evals and compile runs pin this; production policy defaults stay on the
+#: alias (that is a deployment choice), and the promotion gate refuses to
+#: promote on it -- see EnforceCriteria's pinned-model requirement.
+PINNED_EVAL_MODEL = "jev-1.13.0"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_RETRIES = 2
 
@@ -410,6 +417,25 @@ class JevBackend:
                 )
 
         return self._degraded(questions, started, last_error)
+
+    def swap_provider(self, provider_cfg: Mapping[str, Any]) -> "JevBackend":
+        """A new backend pointing at a different PROVIDER with the same model,
+        timeout, retries and question wording. v0.5 cross-provider quota
+        tandem: TypeSafe 429 -> B.AI (same jev-1.13.0) before degrading to a
+        different model, because the cheapest capacity fix is usually the
+        same model on someone else's quota."""
+        import os as _os
+
+        key_env = str(provider_cfg.get("api_key_env", "TYPESAFE_API_KEY"))
+        return JevBackend(
+            api_key=_os.environ.get(key_env, provider_cfg.get("api_key", "")),
+            api_url=str(provider_cfg.get("api_url", self.api_url)),
+            model=self.model,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
+            include_domain=self.include_domain,
+            question_overrides=self.question_overrides,
+        )
 
     def _degraded(self, questions: Mapping[str, Any], started: float, reason: str) -> BackendResult:
         """Maximum-uncertainty answers. The policy engine turns this into fail-closed."""

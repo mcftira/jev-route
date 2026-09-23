@@ -470,6 +470,32 @@ class Router:
             )
             model = self.policy.pick_model(tier)
             if _is_quota_error(backend_result.degrade_reason):
+                # v0.5: same-model cross-provider flip comes FIRST when an
+                # alternate provider is configured -- the cheapest capacity
+                # fix is usually the same model on someone else's quota.
+                original_reason = backend_result.degrade_reason
+                providers = self.policy.raw.get("providers", {}) if isinstance(self.policy.raw, Mapping) else {}
+                if providers and hasattr(self.backend, "swap_provider"):
+                    current = str(providers.get("__current__", "typesafe"))
+                    alternates = [p for p in providers if p != "__current__" and p != current]
+                    if alternates:
+                        alt_name = alternates[0]
+                        alt_cfg = dict(providers[alt_name]) if isinstance(providers[alt_name], Mapping) else {}
+                        swapped = self.backend.swap_provider(alt_cfg)
+                        try:
+                            retry_result = await swapped.decide(request)
+                            if not retry_result.degraded:
+                                providers["__current__"] = alt_name
+                                self.backend = swapped
+                                backend_result = retry_result
+                                backend_name = f"{swapped.name}:{alt_name}"
+                                escalations.append(
+                                    f"provider quota flip: {current} reported quota ({original_reason}); "
+                                    f"served same model via {alt_name}"
+                                )
+                        except Exception:
+                            pass  # the alternate is out too; fall through to the tandem-model path
+            if _is_quota_error(backend_result.degrade_reason):
                 # v0.3 quota tandem: the provider ran out of capacity for this
                 # tier; it is not down. Mark the tier quota-exhausted in the
                 # prefilter config for the rest of the process (the router
