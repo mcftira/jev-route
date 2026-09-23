@@ -1556,8 +1556,11 @@ def _graduate(args: argparse.Namespace, *, load_router: Callable[..., Any], find
     then the backend swap. Gate track (``--track gate``): the semantic layer
     against the promotion criteria, then the mode flip to enforce.
     """
-    if str(getattr(args, "track", "router") or "router") == "gate":
+    track = str(getattr(args, "track", "router") or "router")
+    if track == "gate":
         return _graduate_gate(args)
+    if str(getattr(args, "stage", None) or ""):
+        raise _CliError("--stage is a gate-track option (the live semantic-layer gate); rerun with --track gate")
 
     from .artifact import load_artifact
 
@@ -1754,6 +1757,268 @@ def _print_gate_checks(report: Any) -> None:
         print(report.message().strip())
 
 
+def _resolve_live_window(args: argparse.Namespace, policy: Any) -> Path:
+    """The live shadow window: ``--shadow-window``, else the policy's ``shadow_window`` key.
+
+    Top-level policy key on purpose: the ``gate.semantic`` section is parsed
+    strictly (an unknown key there fails the deploy), and this window is runtime
+    data -- a rolling, gitignored file -- not part of the gate's config surface.
+    """
+    explicit = getattr(args, "shadow_window", None)
+    if explicit:
+        return Path(str(explicit))
+    raw = getattr(policy, "raw", None) or {}
+    configured = str(raw.get("shadow_window") or "").strip()
+    if not configured:
+        raise _CliError(
+            "no live shadow window named. The live gate measures the rolling window the "
+            "layer's ShadowMetrics collector appends to (one line per decided request); "
+            "name it in the policy (top-level `shadow_window:` key) or pass "
+            "--shadow-window <window.jsonl>."
+        )
+    return Path(configured)
+
+
+def _resolve_injection_eval(args: argparse.Namespace, policy: Any) -> Path:
+    """The injection-eval result file: ``--injection-eval-result``, else the policy key."""
+    explicit = getattr(args, "injection_eval_result", None)
+    if explicit:
+        return Path(str(explicit))
+    raw = getattr(policy, "raw", None) or {}
+    configured = str(raw.get("injection_eval_result") or "").strip()
+    if not configured:
+        raise _CliError(
+            "no injection-eval result named. The enforce stage will not promote on a stale or "
+            "absent injection eval; regenerate it (evals/injection/run.py) and name the result "
+            "file in the policy (top-level `injection_eval_result:` key) or pass "
+            "--injection-eval-result <result.json>."
+        )
+    return Path(configured)
+
+
+def _injection_eval_check(path: Path) -> tuple[bool, str, dict[str, Any]]:
+    """Reduce the injection-eval result file to one machine-checkable criterion.
+
+    The file is JSON with ``leaks`` and ``false_positives`` (an int, or a list of
+    case records, either way). When the semantic-enforce columns were run, their
+    ``sem_leaks`` / ``sem_false_positives`` are checked too: the layer being
+    promoted is exactly what those columns measure, and a promotion that ignored
+    them would be graded on a different system than the one being let through.
+    """
+
+    def fail(reason: str) -> tuple[bool, str, dict[str, Any]]:
+        return False, f"{reason}: {path}", {"present": False, "path": str(path)}
+
+    if not path.is_file():
+        return fail("missing file")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return fail(f"unreadable ({exc})")
+    if not isinstance(raw, Mapping):
+        return fail("not a JSON object")
+
+    def count(key: str) -> int | None:
+        if key not in raw:
+            return None
+        value = raw[key]
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        return None
+
+    leaks = count("leaks")
+    false_positives = count("false_positives")
+    if leaks is None or leaks < 0 or false_positives is None or false_positives < 0:
+        return fail("`leaks` and `false_positives` (int or list) are required")
+    sem_leaks = count("sem_leaks") if "sem_leaks" in raw else None
+    sem_false_positives = count("sem_false_positives") if "sem_false_positives" in raw else None
+    total_leaks = leaks + (sem_leaks or 0)
+    total_false_positives = false_positives + (sem_false_positives or 0)
+    ok = total_leaks == 0 and total_false_positives == 0
+    return (
+        ok,
+        f"{total_leaks} leaks / {total_false_positives} FP in {path}",
+        {
+            "present": True,
+            "path": str(path),
+            "leaks": leaks,
+            "false_positives": false_positives,
+            "sem_leaks": sem_leaks,
+            "sem_false_positives": sem_false_positives,
+        },
+    )
+
+
+def _window_evidence(artifact: Any, status: Any, window_path: Path) -> dict[str, Any]:
+    """The live window reduced to the shape a cutover policy carries as shadow evidence.
+
+    The enforce layer re-runs the promotion check at construction, overlaying this
+    on the artifact's holdout metrics via ``merge_metrics`` -- so the model version
+    must match, and the live disagreement becomes what the disagreement bar then
+    measures. ``shadow_n_examples`` is the larger of the two counts: the window is
+    an observation on top of the artifact's shadow period, not a replacement for
+    it, and the cutover file must not make the re-check stricter than the check
+    the gate just passed.
+    """
+    agreement = status.agreement_rate
+    return {
+        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "shadow_model_version": str(artifact.model_version),
+        "shadow_n_examples": max(status.n_decisions, int(artifact.metrics.get("shadow_n_examples") or 0)),
+        "disagreement_rate": round(1.0 - agreement, 6) if agreement is not None else None,
+        "source": f"live shadow window {window_path} (jev_route.shadow_metrics)",
+    }
+
+
+def _live_window_checks(status: Any, eval_path: Path) -> tuple[list[Any], dict[str, Any]]:
+    """The four live criteria, as machine-checkable lines, added on top of check_promotion."""
+    from ..gate_semantic import PromotionCheck
+    from ..shadow_metrics import DRIFT_FACTOR, MIN_AGREEMENT_RATE
+
+    checks: list[Any] = [
+        PromotionCheck(
+            "window_complete",
+            f">= {status.required_decisions} decisions and >= {status.required_days:g} days",
+            f"{status.n_decisions} decisions / {status.days_covered:.1f} days",
+            bool(status.window_complete),
+        ),
+        PromotionCheck(
+            "agreement_rate",
+            f">= {MIN_AGREEMENT_RATE:g}",
+            _num(status.agreement_rate),
+            isinstance(status.agreement_rate, (int, float)) and status.agreement_rate >= MIN_AGREEMENT_RATE,
+        ),
+        PromotionCheck(
+            "drift_alarm",
+            f"no drift (post-baseline disagreement <= {DRIFT_FACTOR:g}x baseline)",
+            "alarm" if status.drift_alarm else "clear",
+            not status.drift_alarm,
+        ),
+    ]
+    ok, measured, payload = _injection_eval_check(eval_path)
+    checks.append(PromotionCheck("injection_eval", "0 leaks / 0 FP", measured, ok))
+    return checks, payload
+
+
+def _print_promotion_summary(status: Any, eval_payload: Mapping[str, Any]) -> None:
+    """On a passing live gate: the numbers that earned the promotion, in one block."""
+    from ..shadow_metrics import ECE_BINS, MIN_AGREEMENT_RATE
+
+    print("PROMOTION SUMMARY: semantic layer shadow -> enforce")
+    print(
+        f"  live window:    {status.n_decisions} decisions over {status.days_covered:.1f} days "
+        f"(required {status.required_decisions} / {status.required_days:g})"
+    )
+    print(f"  agreement:      {status.agreement_rate:.4f} (bar {MIN_AGREEMENT_RATE:g})")
+    print(f"  ece:            {status.ece:.4f} ({ECE_BINS}-bin, shadow probability vs enforce outcome)")
+    print(
+        f"  drift:          clear (baseline {_num(status.baseline_disagreement)}, "
+        f"post-baseline {_num(status.current_disagreement)})"
+    )
+    print(
+        f"  injection eval: {eval_payload.get('leaks', 0)} leaks / {eval_payload.get('false_positives', 0)} FP "
+        f"in {eval_payload.get('path')}"
+    )
+
+
+def _gate_header(stage: str, shadow_source: str, window: Path | None) -> tuple[str, str]:
+    """The report head and the evidence line for a gate-track run."""
+    base = "artifact holdout" + (f" + {shadow_source}" if shadow_source != "none (offline holdout only)" else "")
+    if stage == "enforce":
+        return "graduation: gate track (semantic layer, live stage: enforce)", base + f" + live shadow window ({window})"
+    return "graduation: gate track (semantic layer, shadow -> enforce)", base
+
+
+def _stage_enforce_report(args: argparse.Namespace, policy: Any, criteria: Any, metrics: dict[str, Any]):
+    """The full live promotion gate: ``check_promotion`` plus the live-window requirements.
+
+    Returns ``(report, window_path, window_status, injection_eval_payload)``. The
+    criteria themselves stay in ``check_promotion``; this adds the live evidence
+    (window complete, agreement, drift, injection eval) on top, one check each.
+    The live window is the fresher evidence for the traffic-dependent numbers, so
+    where both speak it wins: the disagreement bar then measures the window, and
+    the shadow-example count is the sum of the two observations, not the smaller.
+    """
+    from ..gate_semantic import PromotionReport, check_promotion
+    from ..shadow_metrics import ShadowMetrics
+
+    if policy is None:
+        raise _CliError(
+            "--stage enforce needs a policy: the live window (`shadow_window`) and the "
+            "injection-eval result (`injection_eval_result`) are named there. Pass --policy."
+        )
+    window = _resolve_live_window(args, policy)
+    status = ShadowMetrics(window).window_status()
+    if status.n_decisions and status.agreement_rate is not None:
+        metrics["disagreement_rate"] = round(1.0 - status.agreement_rate, 6)
+        metrics["shadow_n_examples"] = max(int(metrics.get("shadow_n_examples") or 0), status.n_decisions)
+    report = check_promotion(criteria, metrics)
+    eval_path = _resolve_injection_eval(args, policy)
+    live_checks, eval_payload = _live_window_checks(status, eval_path)
+    combined = PromotionReport(
+        criteria=report.criteria,
+        metrics={**metrics, "live_window": status.to_dict(), "injection_eval": eval_payload},
+        checks=report.checks + tuple(live_checks),
+    )
+    return combined, window, status, eval_payload
+
+
+def _graduate_gate_shadow(args: argparse.Namespace, policy: Any) -> int:
+    """``--stage shadow``: how far the live window has come. A report, not a verdict."""
+    from ..shadow_metrics import ECE_BINS, MIN_AGREEMENT_RATE, ShadowMetrics
+
+    window = _resolve_live_window(args, policy)
+    status = ShadowMetrics(window).window_status()
+    if args.json:
+        _print_json({"track": "gate", "stage": "shadow", "window": str(window), "status": status.to_dict()})
+        return EXIT_OK
+    print("graduation: gate track (semantic layer, live stage: shadow)")
+    print(f"  window:       {window}")
+    print(f"  n_decisions:  {status.n_decisions} (window completes at {status.required_decisions})")
+    print(f"  days_covered: {status.days_covered:.1f} (window completes at {status.required_days:g})")
+    print(f"  agreement:    {_num(status.agreement_rate)} (promotion bar {MIN_AGREEMENT_RATE:g})")
+    print(f"  ece:          {_num(status.ece)} ({ECE_BINS}-bin, shadow probability vs enforce outcome)")
+    print(f"  drift_alarm:  {status.drift_alarm}")
+    if status.window_complete:
+        print("  WINDOW COMPLETE: the live shadow period satisfies the window requirement.")
+        _next_step("run with --stage enforce to grade it against the full live gate")
+    else:
+        missing: list[str] = []
+        if status.n_decisions < status.required_decisions:
+            missing.append(f"{status.required_decisions - status.n_decisions} more decisions")
+        if status.days_covered < status.required_days:
+            missing.append(f"{status.required_days - status.days_covered:.1f} more days")
+        print(f"  window incomplete: needs {', '.join(missing)}")
+    return EXIT_OK
+
+
+def _cutover_evidence(stage: str, artifact: Any, status: Any, window: Path) -> dict[str, Any]:
+    """The shadow evidence the cutover policy carries for an enforce flip.
+
+    On the live enforce stage the window itself IS that evidence: the gate just
+    graded it, so the cutover file carries the window's reduced numbers instead
+    of requiring a second ``--shadow-metrics`` file. Any other stage still needs
+    the explicitly supplied shadow observation.
+    """
+    if stage != "enforce":
+        raise _CliError(
+            "--write needs live shadow evidence for the cutover policy to carry; "
+            "pass --shadow-metrics or --log. An enforce policy with no shadow observation "
+            "refuses to construct, because its live criteria would be unmeasurable."
+        )
+    return _window_evidence(artifact, status, window)
+
+
+def _maybe_print_promotion_summary(stage: str, status: Any, eval_payload: Mapping[str, Any]) -> None:
+    if stage == "enforce":
+        print()
+        _print_promotion_summary(status, eval_payload)
+
+
 def _graduate_gate(args: argparse.Namespace) -> int:
     """Gate track: promote the semantic layer from shadow to enforce -- or refuse, with the numbers.
 
@@ -1764,11 +2029,24 @@ def _graduate_gate(args: argparse.Namespace) -> int:
     flip (``gate.semantic.mode: enforce``), and it is only written when every
     check passes -- a refusal here exits ``1`` with the measured numbers, exactly
     like the router track.
+
+    ``--stage`` selects the live gate. Omitted (the default), this is today's
+    behaviour: holdout plus optional shadow-log evidence. ``--stage shadow``
+    reports the rolling live window -- how far the shadow period has come --
+    without a promotion verdict. ``--stage enforce`` grades the full live
+    promotion gate on top of the same criteria: the window must be complete
+    (>= 500 decisions over >= 7 days), the agreement with the deterministic layer
+    must be >= 0.95, the drift alarm must be clear, and a fresh injection-eval
+    result file (path from the policy) must show 0 leaks / 0 FP. Every criterion
+    gets one machine-checkable line.
     """
     from ..gate_semantic import EnforceCriteria, SemanticArtifact, check_promotion
 
     if getattr(args, "replay", False) or getattr(args, "data", None) is not None:
         raise _CliError("--replay and --data are router-track options; rerun with --track router")
+    stage = str(getattr(args, "stage", None) or "")
+    if stage not in ("", "shadow", "enforce"):
+        raise _CliError(f"unknown --stage {stage!r}: use `shadow`, `enforce`, or omit it")
 
     try:
         artifact = SemanticArtifact.load(args.artifact)
@@ -1788,32 +2066,46 @@ def _graduate_gate(args: argparse.Namespace) -> int:
         criteria = policy.semantic_gate.enforce_requires
         criteria_source = f"enforce_requires in {policy_path}"
 
-    report = check_promotion(criteria, metrics)
+    if stage == "shadow":
+        return _graduate_gate_shadow(args, policy)
+    if stage == "enforce":
+        report, window, status, eval_payload = _stage_enforce_report(args, policy, criteria, metrics)
+    else:
+        report, window, status, eval_payload = check_promotion(criteria, metrics), None, None, {}
 
     if args.json:
-        _print_json(
-            {
-                "track": "gate",
-                "artifact": str(artifact.source),
-                "model_version": artifact.model_version,
-                "criteria": criteria_source,
-                "shadow": shadow_source,
-                "metrics": metrics,
-                "report": report.to_dict(),
-                "wrote": None,
-            }
-        )
+        payload: dict[str, Any] = {
+            "track": "gate",
+            "artifact": str(artifact.source),
+            "model_version": artifact.model_version,
+            "criteria": criteria_source,
+            "shadow": shadow_source,
+            "metrics": metrics,
+            "report": report.to_dict(),
+            "wrote": None,
+        }
+        if stage == "enforce":
+            payload.update(
+                {
+                    "stage": "enforce",
+                    "live_window": str(window),
+                    "live_window_status": status.to_dict(),
+                    "injection_eval": eval_payload,
+                }
+            )
+        _print_json(payload)
         return EXIT_OK if report.ok else EXIT_NOT_READY
 
-    print("graduation: gate track (semantic layer, shadow -> enforce)")
+    header, evidence = _gate_header(stage, shadow_source, window)
+    print(header)
     print(f"  artifact:   {artifact.source}  (model_version {artifact.model_version})")
     print(f"  criteria:   {criteria_source}")
-    evidence = "artifact holdout" + (f" + {shadow_source}" if shadow_source != "none (offline holdout only)" else "")
     print(f"  evidence:   {evidence}")
     print()
     _print_gate_checks(report)
     if not report.ok:
         return EXIT_NOT_READY
+    _maybe_print_promotion_summary(stage, status, eval_payload)
     if not args.write:
         _next_step("ready: rerun with --write to flip the policy to gate.semantic.mode: enforce")
         return EXIT_OK
@@ -1821,11 +2113,7 @@ def _graduate_gate(args: argparse.Namespace) -> int:
     if policy is None:
         raise _CliError("--write on the gate track needs a policy to flip; pass --policy")
     if shadow_metrics is None:
-        raise _CliError(
-            "--write needs live shadow evidence for the cutover policy to carry; "
-            "pass --shadow-metrics or --log. An enforce policy with no shadow observation "
-            "refuses to construct, because its live criteria would be unmeasurable."
-        )
+        shadow_metrics = _cutover_evidence(stage, artifact, status, window)
     dest, backup = _gate_swap(
         args, policy, policy_path, artifact_path=str(args.artifact), shadow_metrics=shadow_metrics
     )
