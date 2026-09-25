@@ -478,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=20260922)
     p.add_argument("--reflection-model", default="openai/w/models/Qwen3.8-27B-Q8_0.gguf",
                    help="litellm model string for GEPA reflection")
-    p.add_argument("--reflection-base", default="http://192.168.1.124:8010/v1",
+    p.add_argument("--reflection-base", default="http://localhost:8000/v1",
                    help="OpenAI-compatible endpoint for the reflection model")
     p.add_argument("--dry-run", action="store_true", help="validate seed/dataset/evaluator without spending calls")
     p.set_defaults(func=_cmd_optimize_questions)
@@ -577,6 +577,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--shadow-metrics", default=None, help="gate track: live shadow metrics JSON (from measure_shadow_log)"
     )
     p.add_argument("--log", default=None, help="gate track: measure live shadow metrics from this decision log")
+    p.add_argument(
+        "--stage",
+        choices=["shadow", "enforce"],
+        default=None,
+        help=(
+            "gate track: the live gate. shadow = report the rolling live shadow window; "
+            "enforce = the full live promotion gate (window complete, agreement >= 0.95, no "
+            "drift, injection eval 0/0) on top of the promotion criteria. Omit for today's behavior."
+        ),
+    )
+    p.add_argument(
+        "--shadow-window",
+        default=None,
+        help="gate track: live shadow window JSONL (default: the policy's top-level `shadow_window` key)",
+    )
+    p.add_argument(
+        "--injection-eval-result",
+        default=None,
+        help="gate track: injection-eval result JSON (default: the policy's top-level `injection_eval_result` key)",
+    )
     p.add_argument(
         "--replay", action="store_true", help="re-run held-out prompts through the live teacher (needs a Jev key)"
     )

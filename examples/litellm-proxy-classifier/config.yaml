@@ -28,7 +28,7 @@ model_list:
   - model_name: qwen38
     litellm_params:
       model: openai/qwen3.8
-      api_base: http://192.168.1.124:8010/v1
+      api_base: http://localhost:8000/v1
       # llama.cpp ignores the key but litellm requires a non-empty one.
       api_key: "EMPTY"
 

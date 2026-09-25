@@ -72,7 +72,7 @@ from jev_route.integrations.litellm_plugin import JevRouteRoutingPlugin
 #: the group it is asked about.
 LOCAL = {
     "model": "openai/qwen3.8",
-    "api_base": os.environ.get("JEV_ROUTE_LOCAL_API_BASE", "http://192.168.1.124:8010/v1"),
+    "api_base": os.environ.get("JEV_ROUTE_LOCAL_API_BASE", "http://localhost:8000/v1"),
     # llama.cpp ignores the key; litellm requires a non-empty value.
     "api_key": "EMPTY",
 }
