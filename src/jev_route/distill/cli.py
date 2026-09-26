@@ -1874,7 +1874,24 @@ def _window_evidence(artifact: Any, status: Any, window_path: Path) -> dict[str,
     }
 
 
-def _live_window_checks(status: Any, eval_path: Path, *, policy_backend_model: str | None = None) -> tuple[list[Any], dict[str, Any]]:
+def _contrastive_flip_check(path: Path, criteria: Any) -> tuple[bool, str]:
+    """The contrastive flip-accuracy result (a pinned-model run's result.json).
+    Absent file -> the check fails by name: a promotion that never measured
+    scope flips is promoted on a head that may not see scope."""
+    if not path.is_file():
+        return False, f"missing file: {path}"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        acc = float(raw.get("flip_accuracy"))
+    except Exception as exc:
+        return False, f"unreadable ({exc})"
+    return acc >= criteria.min_flip_accuracy, f"flip_accuracy {acc:.3f}"
+
+
+def _live_window_checks(
+    status: Any, eval_path: Path, *, policy_backend_model: str | None = None,
+    contrastive_path: Path | None = None, criteria: Any = None,
+) -> tuple[list[Any], dict[str, Any]]:
     """The four live criteria, as machine-checkable lines, added on top of check_promotion."""
     from ..gate_semantic import PromotionCheck
     from ..shadow_metrics import DRIFT_FACTOR, MIN_AGREEMENT_RATE
@@ -1901,6 +1918,9 @@ def _live_window_checks(status: Any, eval_path: Path, *, policy_backend_model: s
     ]
     ok, measured, payload = _injection_eval_check(eval_path)
     checks.append(PromotionCheck("injection_eval", "0 leaks / 0 FP", measured, ok))
+    if contrastive_path is not None:
+        cok, cmeasured = _contrastive_flip_check(contrastive_path, criteria)
+        checks.append(PromotionCheck("contrastive_flip", f">= {criteria.min_flip_accuracy:g}", cmeasured, cok))
     # v0.5 reproducibility bar: promotion is refused on a moving alias. Every
     # metric in the report was measured against one model version; an alias
     # makes them unverifiable the day the alias moves.
@@ -1974,7 +1994,16 @@ def _stage_enforce_report(args: argparse.Namespace, policy: Any, criteria: Any, 
     if policy is not None:
         backend_cfg = policy.backend if isinstance(policy.backend, Mapping) else {}
         backend_model = str(backend_cfg.get("model", ""))
-    live_checks, eval_payload = _live_window_checks(status, eval_path, policy_backend_model=backend_model)
+    contrastive_path = None
+    if policy is not None:
+        raw = policy.raw if isinstance(policy.raw, Mapping) else {}
+        named = str(raw.get("contrastive_eval_result") or "").strip()
+        if named:
+            contrastive_path = Path(named)
+    live_checks, eval_payload = _live_window_checks(
+        status, eval_path, policy_backend_model=backend_model,
+        contrastive_path=contrastive_path, criteria=criteria,
+    )
     combined = PromotionReport(
         criteria=report.criteria,
         metrics={**metrics, "live_window": status.to_dict(), "injection_eval": eval_payload},

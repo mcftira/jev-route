@@ -1,0 +1,317 @@
+{
+  "n_pairs": 400,
+  "flip_accuracy": 0.85,
+  "per_domain": {
+    "sensitivity": 0.7,
+    "routing": 1.0
+  },
+  "per_kind": {
+    "card_luhn": 1.0,
+    "taj": 1.0,
+    "ssn": 0.0,
+    "one_liner_vs_refactor": 1.0,
+    "one_liner_vs_migration": 1.0
+  },
+  "misses": [
+    {
+      "id": "ce-sensitivity-ssn-000",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-001",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-002",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-003",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-004",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-005",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-006",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-007",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-008",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-009",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-010",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-011",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-012",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-013",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-014",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-015",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-016",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-017",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-018",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-019",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-020",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-021",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-022",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-023",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-024",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-025",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-026",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-027",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-028",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-029",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-030",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-031",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-032",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-033",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-034",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-035",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-036",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-037",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-038",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-039",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-040",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-041",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-042",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-043",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-044",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-045",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-046",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-047",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-048",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-049",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-050",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-051",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-052",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-053",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-054",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-055",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-056",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-057",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-058",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    },
+    {
+      "id": "ce-sensitivity-ssn-059",
+      "kind": "ssn",
+      "decision": "blocks:us_ssn"
+    }
+  ]
+}

@@ -74,12 +74,13 @@ import math
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from .schema import SENSITIVITY_LEVELS, GateVerdict, RequestFeatures, level_index
+from .shadow_metrics import ShadowMetrics, maybe_demote
 
 if TYPE_CHECKING:
     # Import-for-typing only. The two policy/gate modules are stdlib-light, but
@@ -200,6 +201,11 @@ class EnforceCriteria:
     max_false_positive_rate: float = 0.02
     max_disagreement_rate: float = 0.05
     max_semantic_miss_rate: float = 0.02
+    #: v0.5 Phase 4: the flip-accuracy bar on the contrastive eval, measured in
+    #: shadow on a pinned model (the decision must change when the key fact
+    #: changes). 0.98 default; a promotion that never flipped on a scope
+    #: mutation would be promoted on a head that cannot see scope.
+    min_flip_accuracy: float = 0.98
     min_positive_examples: int = 200
     min_negative_examples: int = 500
     min_shadow_examples: int = 1000
@@ -954,6 +960,7 @@ class SemanticLayer:
         scorer: SemanticScorer | None = None,
         artifact: SemanticArtifact | None = None,
         metrics: Mapping[str, Any] | None = None,
+        shadow_metrics: ShadowMetrics | None = None,
     ) -> None:
         """
         Args:
@@ -966,10 +973,21 @@ class SemanticLayer:
                 them from. Only reachable from code: there is no config key that
                 supplies metrics, because a number an operator typed is not a
                 measurement.
+            shadow_metrics: the live per-decision agreement window
+                (:class:`~jev_route.shadow_metrics.ShadowMetrics`), when the host
+                wants the layer to feed it. Distinct from the
+                ``gate.semantic.shadow_metrics`` *path* in config, which is the
+                offline shadow-log measurement: this is the rolling window that
+                also carries the drift alarm, and a layer enforcing with one
+                demotes itself when that alarm trips.
         """
         self.config = config
         self.artifact = artifact
         self.unavailable_reason: str | None = None
+        self.shadow_metrics = shadow_metrics
+        #: True once auto-demotion has flipped this layer out of enforce in-process.
+        self.demoted = False
+        self.demotion_reason: str | None = None
         self._counts: dict[str, int] = {
             "assessed": 0,
             "inert": 0,
@@ -1157,6 +1175,8 @@ class SemanticLayer:
             self._counts["enforced"] += 1
         if disagreement is not None:
             self._counts[disagreement] += 1
+        if self.shadow_metrics is not None:
+            self._observe_live_window(score=score, layer1_fired=layer1_fired)
 
         return SemanticAssessment(
             mode=self.config.mode,
@@ -1175,6 +1195,36 @@ class SemanticLayer:
             disagreement=disagreement,
         )
 
+    def _observe_live_window(self, *, score: float, layer1_fired: bool) -> None:
+        """Feed one decided request into the live window, and demote on drift.
+
+        Telemetry, not protection: every failure here is swallowed, because the
+        request has already been decided and a broken window must never break
+        traffic. When the layer is enforcing and the window's post-baseline
+        disagreement has drifted past ``DRIFT_FACTOR`` x its baseline,
+        :func:`~jev_route.shadow_metrics.maybe_demote` writes the
+        ``jev_route.demotion`` event and this layer demotes itself in-process:
+        it keeps scoring (the window keeps rolling, so a recovered head is
+        re-measurable), but it stops asserting until it is re-promoted through
+        the gate. The request that triggered the demotion still carries the
+        decision that was already made; the next one does not enforce.
+        """
+        try:
+            self.shadow_metrics.record(decision_fired=layer1_fired, shadow_score=score, threshold=self.threshold)
+        except Exception:
+            return
+        if not self.config.enforces:
+            return
+        try:
+            if not maybe_demote(self.shadow_metrics):
+                return
+            self.config = replace(self.config, mode="shadow")
+            self.demoted = True
+            event = self.shadow_metrics.last_event or {}
+            self.demotion_reason = str(event.get("reason") or "live disagreement drift alarm")
+        except Exception:
+            pass
+
     def stats(self) -> dict[str, Any]:
         """In-process counters. The log is the durable copy; this is the live one."""
         assessed = self._counts["assessed"]
@@ -1183,8 +1233,11 @@ class SemanticLayer:
             "active": self.active,
             "model_version": self.model_version,
             "threshold": self.threshold,
+            "demoted": self.demoted,
             **dict(self._counts),
         }
+        if self.demotion_reason:
+            out["demotion_reason"] = self.demotion_reason
         if self.unavailable_reason:
             out["unavailable_reason"] = self.unavailable_reason
         if assessed:
