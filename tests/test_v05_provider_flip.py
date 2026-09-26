@@ -15,7 +15,7 @@ from tests.conftest import FakeBackend
 class QuotaThenOkBackend(FakeBackend):
     """Degrades with a 429 on the primary; serves on the alternate."""
 
-    def __init__(self, alt: "MockBackend") -> None:
+    def __init__(self, alt: MockBackend) -> None:
         super().__init__(degraded=True, degrade_reason="HTTP 429 quota exceeded")
         self._alt = alt
 

@@ -1,0 +1,35 @@
+{
+  "disjointness": "verified at generation time: no shared pair id, no shared text (base or variant)",
+  "eval_pairs": {
+    "routing": {
+      "one_liner_vs_migration": 100,
+      "one_liner_vs_refactor": 100
+    },
+    "sensitivity": {
+      "card_luhn": 80,
+      "ssn": 60,
+      "taj": 60
+    }
+  },
+  "eval_seed": "eval-v0.5",
+  "fakeness": {
+    "card_luhn": "variant: published vendor test PAN (Luhn-valid, publicly reserved, citation on the row); base: the same PAN with the check digit broken (Luhn-invalid, no issuer assigns it)",
+    "routing": "no PII; fictional module, table and job names only",
+    "ssn": "base: SSA never-issued area numbers 000/666/900-999 (provably not a person's number); variant: structurally-issuable area 219, a constructed placeholder in a controlled corpus, never captured",
+    "taj": "9-digit TAJ placeholders with the 000 lead group (repo fixture convention), constructed, never captured"
+  },
+  "generator": "jev_route.distill.contrastive.generate_pairs",
+  "note": "no real PANs, SSNs, TAJ numbers, names or credentials; every identifier is constructed",
+  "train_pairs": {
+    "routing": {
+      "one_liner_vs_migration": 200,
+      "one_liner_vs_refactor": 200
+    },
+    "sensitivity": {
+      "card_luhn": 160,
+      "ssn": 120,
+      "taj": 120
+    }
+  },
+  "train_seed": "train-v0.5"
+}
